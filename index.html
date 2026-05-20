@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arke Cashflow Hub</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  /* Per Arke Brand Guidelines §3.2 — Century Gothic is the websafe/digital font.
+     System stack falls back to Avenir Next / Avenir on macOS/iOS, Century Gothic
+     on Windows, and a sensible sans-serif elsewhere. */
+  body { font-family: "Century Gothic", "Avenir Next", Avenir, "URW Gothic", "Trebuchet MS", system-ui, sans-serif; background: #FAF7F8; color: #2A2A2A; }
+  #root { min-height: 100vh; }
+  input:focus, textarea:focus, select:focus, button:focus { outline: 2px solid #8C002A; outline-offset: -1px; }
+  /* Splash */
+  .arke-splash {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #FAF7F8; z-index: 9999; transition: opacity 0.3s ease;
+  }
+  .arke-splash.hide { opacity: 0; pointer-events: none; }
+  .arke-splash-mark { font-family: "Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif; font-size: 36px; color: #8C002A; font-weight: 400; letter-spacing: -0.01em; }
+  .arke-splash-text { color: #6B6B6B; font-size: 13px; margin-top: 8px; text-align: center; }
+  /* Modal backdrop */
+  .arke-modal-backdrop {
+    position: fixed; inset: 0; background: rgba(26,26,26,0.55); z-index: 1000;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .arke-modal {
+    background: #fff; border-radius: 8px; max-width: 520px; width: 100%;
+    max-height: 90vh; overflow-y: auto; padding: 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+  }
+  /* Sidebar transitions */
+  .arke-sidebar-item { transition: background 0.1s, color 0.1s; }
+  .arke-sidebar-item:hover { background: #FCF5F6; }
+  .arke-sidebar-item.active { background: #F4D9DD; color: #8C002A; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="arke-splash" id="splash">
+    <div style="text-align:center">
+      <div class="arke-splash-mark">arke</div>
+      <div class="arke-splash-text">Cashflow Hub loading…</div>
+    </div>
+  </div>
+</div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="env,react">
+// ============================================================
+// ARKE CASHFLOW HUB — Stage 1
+// Single-file React app, raw REST against Supabase, no SDK.
+// Hash routing, role-aware access, sidebar layout, route stubs.
+// ============================================================
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ============================================================
+// CONFIG — replace these with your fresh Supabase project values
+// ============================================================
+const SUPABASE_URL = 'https://drijoaczyyilwxmtneqa.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRyaWpvYWN6eXlpbHd4bXRuZXFhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyODMzNTUsImV4cCI6MjA5NDg1OTM1NX0.EF-MMOM5fLXCaIbVVw1k7vROX3oP2IZOjAQOTk9m3Ik';
+const ARKE_DOMAIN = '@arkecreative.co.uk';
+const SESSION_KEY = 'arke_cashflow_session';
+const PREFS_KEY = 'arke_cashflow_prefs';
+
+// ============================================================
+// BRAND PALETTE (per Arke Brand Guidelines)
+// Carmine #8C002A primary, Prussian #183B4F secondary.
+// ============================================================
+const C = {
+  red: '#8C002A', redDark: '#660020', redLight: '#F4D9DD', redMid: '#E8C0C8', redSoft: '#FCF5F6',
+  prussian: '#183B4F', prussianLight: '#D9E0E5',
+  ink: '#000000', text: '#2A2A2A', muted: '#6B6B6B', line: '#E5E0E2',
+  bg: '#FAF7F8', white: '#FFFFFF',
+  green: '#2E7D32', greenLight: '#E8F5E9',
+  amber: '#B07308', amberLight: '#FBF1D9',
+  blue: '#183B4F', blueLight: '#D9E0E5',
+  redStatus: '#C62828', redStatusLight: '#FFEBEE',
+};
+
+// ============================================================
+// SUPABASE AUTH — ported verbatim from furniture form
+// ============================================================
+async function signIn(email, password) {
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.error_description || err.msg || `Sign-in failed (${r.status})`);
+  }
+  const session = await r.json();
+  session.expires_at = Math.floor(Date.now() / 1000) + (session.expires_in || 3600);
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  return session;
+}
+
+async function refreshSession(session) {
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST',
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: session.refresh_token }),
+  });
+  if (!r.ok) {
+    localStorage.removeItem(SESSION_KEY);
+    return null;
+  }
+  const fresh = await r.json();
+  fresh.expires_at = Math.floor(Date.now() / 1000) + (fresh.expires_in || 3600);
+  localStorage.setItem(SESSION_KEY, JSON.stringify(fresh));
+  return fresh;
+}
+
+function getStoredSession() {
+  try {
+    const s = localStorage.getItem(SESSION_KEY);
+    return s ? JSON.parse(s) : null;
+  } catch (e) { return null; }
+}
+
+function signOut() {
+  localStorage.removeItem(SESSION_KEY);
+  window.location.hash = '';
+  window.location.reload();
+}
+
+function getEmail(session) {
+  return session && session.user && session.user.email ? session.user.email : null;
+}
+
+function isArkeUser(session) {
+  const e = getEmail(session);
+  return !!(e && e.toLowerCase().endsWith(ARKE_DOMAIN));
+}
+
+function useSession() {
+  const [session, setSession] = useState(getStoredSession());
+  useEffect(() => {
+    let cancelled = false;
+    const maybeRefresh = async () => {
+      const s = getStoredSession();
+      if (!s) { if (!cancelled) setSession(null); return; }
+      const now = Math.floor(Date.now() / 1000);
+      if (s.expires_at && (s.expires_at - now) < 300) {
+        const fresh = await refreshSession(s);
+        if (!cancelled) setSession(fresh);
+      } else {
+        if (!cancelled) setSession(s);
+      }
+    };
+    maybeRefresh();
+    const interval = setInterval(maybeRefresh, 10 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+  return [session, setSession];
+}
+
+// ============================================================
+// SUPABASE REST CLIENT — ported verbatim
+// ============================================================
+function sbHeaders(session) {
+  const token = (session && session.access_token) ? session.access_token : SUPABASE_ANON_KEY;
+  return {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation',
+  };
+}
+
+async function sbSelect(table, query, session) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
+  const r = await fetch(url, { headers: sbHeaders(session) });
+  if (!r.ok) throw new Error(`Select failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function sbInsert(table, data, session) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}`;
+  const r = await fetch(url, {
+    method: 'POST', headers: sbHeaders(session), body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error(`Insert failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function sbUpdate(table, query, data, session) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
+  const r = await fetch(url, {
+    method: 'PATCH', headers: sbHeaders(session), body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error(`Update failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function sbDelete(table, query, session) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
+  const r = await fetch(url, {
+    method: 'DELETE', headers: sbHeaders(session),
+  });
+  if (!r.ok) throw new Error(`Delete failed: ${r.status} ${await r.text()}`);
+  return r.status === 204 ? null : r.json();
+}
+
+// ============================================================
+// CRYPTO HELPERS — kept for future use (CSV preset sharing etc.)
+// ============================================================
+async function hashPassword(password, saltB64, iterations) {
+  const enc = new TextEncoder();
+  const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    keyMaterial, 256
+  );
+  return btoa(String.fromCharCode(...new Uint8Array(bits)));
+}
+
+function generateSalt() {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr));
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+async function getClientIP() {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    if (!r.ok) return null;
+    const d = await r.json();
+    return d.ip || null;
+  } catch (e) { return null; }
+}
+
+function fmtMoney(n) {
+  if (n === null || n === undefined || n === '' || isNaN(Number(n))) return '';
+  return Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPct(n) {
+  if (n === null || n === undefined || n === '' || isNaN(Number(n))) return '';
+  return Number(n).toFixed(2) + '%';
+}
+
+function fmtDate(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleString('en-GB', {
+    day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const sec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (sec < 60) return 'just now';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  if (sec < 86400) return Math.floor(sec / 3600) + 'h';
+  if (sec < 86400 * 30) return Math.floor(sec / 86400) + 'd';
+  if (sec < 86400 * 365) return Math.floor(sec / (86400 * 30)) + 'mo';
+  return Math.floor(sec / (86400 * 365)) + 'y';
+}
+
+// ============================================================
+// HASH ROUTING — new for this app
+// Path: #/projects/abc?tab=schedule  =>
+//   { path: ['projects', 'abc'], params: { tab: 'schedule' } }
+// ============================================================
+function parseHash(hash) {
+  // Strip leading '#' and '/'
+  let h = (hash || '').replace(/^#/, '').replace(/^\//, '');
+  if (h === '') return { path: [], params: {} };
+  const [pathStr, queryStr] = h.split('?');
+  const path = pathStr.split('/').filter(Boolean).map(decodeURIComponent);
+  const params = {};
+  if (queryStr) {
+    for (const pair of queryStr.split('&')) {
+      const [k, v] = pair.split('=');
+      if (k) params[decodeURIComponent(k)] = v == null ? '' : decodeURIComponent(v);
+    }
+  }
+  return { path, params };
+}
+
+function buildHash(path, params) {
+  let h = '#/' + (path || []).map(encodeURIComponent).join('/');
+  if (params && Object.keys(params).length > 0) {
+    const qs = Object.entries(params)
+      .filter(([k, v]) => v != null && v !== '')
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    if (qs) h += '?' + qs;
+  }
+  return h;
+}
+
+function useHashRoute() {
+  const [route, setRoute] = useState(() => parseHash(window.location.hash));
+  useEffect(() => {
+    const handler = () => setRoute(parseHash(window.location.hash));
+    window.addEventListener('hashchange', handler);
+    return () => window.removeEventListener('hashchange', handler);
+  }, []);
+  const navigate = useCallback((path, params, replace) => {
+    const hash = buildHash(path, params);
+    if (replace) {
+      const url = window.location.href.split('#')[0] + hash;
+      window.history.replaceState(null, '', url);
+      setRoute(parseHash(hash));
+    } else {
+      window.location.hash = hash;
+    }
+  }, []);
+  return { route, navigate };
+}
+
+// ============================================================
+// ACCESS CONTROL — new
+// Wraps useSession and resolves the user's cashflow_users row.
+// Returns { session, role, displayName, hasAccess, loading, error, refetch }
+// ============================================================
+function useAccessControl() {
+  const [session, setSession] = useSession();
+  const [state, setState] = useState({
+    role: null, displayName: null, hasAccess: false, loading: true, error: null,
+  });
+
+  const fetchRole = useCallback(async () => {
+    if (!session) {
+      setState({ role: null, displayName: null, hasAccess: false, loading: false, error: null });
+      return;
+    }
+    if (!isArkeUser(session)) {
+      setState({ role: null, displayName: null, hasAccess: false, loading: false, error: 'non_arke' });
+      return;
+    }
+    try {
+      // RLS allows self-read on cashflow_users via cu_self_read policy
+      const rows = await sbSelect('cashflow_users', `user_id=eq.${session.user.id}&select=role,display_name,active&limit=1`, session);
+      if (!rows || rows.length === 0) {
+        setState({ role: null, displayName: null, hasAccess: false, loading: false, error: 'no_row' });
+        return;
+      }
+      const row = rows[0];
+      if (!row.active) {
+        setState({ role: row.role, displayName: row.display_name, hasAccess: false, loading: false, error: 'inactive' });
+        return;
+      }
+      setState({ role: row.role, displayName: row.display_name, hasAccess: true, loading: false, error: null });
+    } catch (e) {
+      setState({ role: null, displayName: null, hasAccess: false, loading: false, error: e.message });
+    }
+  }, [session]);
+
+  useEffect(() => { fetchRole(); }, [fetchRole]);
+
+  return { session, setSession, ...state, refetch: fetchRole };
+}
+
+// ============================================================
+// ROOT
+// ============================================================
+function App() {
+  const access = useAccessControl();
+  const { route, navigate } = useHashRoute();
+
+  if (access.loading) {
+    return <Shell session={access.session}><LoadingMsg label="Loading…" /></Shell>;
+  }
+
+  // Not signed in at all
+  if (!access.session) {
+    return <Shell session={null}><PublicLanding /></Shell>;
+  }
+
+  // Signed in but no access (wrong domain / not in cashflow_users / inactive)
+  if (!access.hasAccess) {
+    return <Shell session={access.session}><NoAccessScreen reason={access.error} email={getEmail(access.session)} /></Shell>;
+  }
+
+  // Authed and authorised — render the sidebar shell with current route
+  return (
+    <SignedInShell access={access} route={route} navigate={navigate}>
+      <RouteSwitch route={route} navigate={navigate} access={access} />
+    </SignedInShell>
+  );
+}
+
+// ============================================================
+// ROUTE SWITCH
+// Routes a user can hit depend on their role. Any disallowed route → home.
+// ============================================================
+function RouteSwitch({ route, navigate, access }) {
+  const isEditor = access.role === 'editor';
+  const seg = route.path[0] || '';
+
+  // Editor-only routes
+  const editorOnly = ['cashflow', 'debtors', 'overheads', 'settings'];
+
+  // Wrong route for role → bounce home
+  if (!isEditor && editorOnly.includes(seg)) {
+    useEffect(() => { navigate([], {}, true); }, []);
+    return <LoadingMsg label="Redirecting…" />;
+  }
+
+  // Home — different by role
+  if (seg === '' || seg === 'home') {
+    return isEditor ? <CashflowPage access={access} /> : <ContributorHome access={access} navigate={navigate} />;
+  }
+  if (seg === 'cashflow') return <CashflowPage access={access} />;
+  if (seg === 'projects') {
+    if (route.path[1] === 'new') return <NewProjectStub />;
+    if (route.path[1]) return <ProjectDetailStub id={route.path[1]} access={access} />;
+    return <ProjectsListStub access={access} />;
+  }
+  if (seg === 'debtors') {
+    if (route.path[1] === 'import') return <DebtorImportStub />;
+    return <DebtorListStub />;
+  }
+  if (seg === 'overheads') return <OverheadListStub />;
+  if (seg === 'settings') {
+    if (route.path[1] === 'users') return <SettingsUsersStub />;
+    if (route.path[1] === 'categories') return <SettingsCategoriesStub />;
+    if (route.path[1] === 'csv-presets') return <SettingsCsvPresetsStub />;
+    return <SettingsHubStub />;
+  }
+  return <NotFound navigate={navigate} />;
+}
+
+// ============================================================
+// PUBLIC LANDING (not signed in)
+// ============================================================
+function PublicLanding() {
+  const [showSignIn, setShowSignIn] = useState(false);
+  return (
+    <div style={{ maxWidth: 540, margin: '80px auto', textAlign: 'center', padding: '0 24px' }}>
+      <h1 style={brandTitle()}>Arke Cashflow Hub</h1>
+      <p style={{ color: C.muted, fontSize: 15, lineHeight: 1.6, marginBottom: 32 }}>
+        Internal tool for tracking project cashflow, debtors, and overheads.
+        Access is by invitation — speak to an editor to be added.
+      </p>
+      <button onClick={() => setShowSignIn(true)} style={btn(false)}>
+        Sign in
+      </button>
+      {showSignIn && <SignInModal onClose={() => setShowSignIn(false)} onSignedIn={() => window.location.reload()} />}
+    </div>
+  );
+}
+
+// ============================================================
+// NO ACCESS SCREEN
+// ============================================================
+function NoAccessScreen({ reason, email }) {
+  const messages = {
+    non_arke: {
+      title: 'Wrong account',
+      body: `This tool is only available to @arkecreative.co.uk accounts. You're signed in as ${email}.`,
+    },
+    no_row: {
+      title: 'Access not yet granted',
+      body: `You're signed in as ${email} but you haven't been added to the Cashflow Hub yet. Ask an editor to add you in Settings → Users.`,
+    },
+    inactive: {
+      title: 'Access deactivated',
+      body: `Your account (${email}) has been deactivated. Speak to an editor if you think that's a mistake.`,
+    },
+  };
+  const m = messages[reason] || { title: 'Access denied', body: `Couldn't verify access for ${email}.` };
+  return (
+    <div style={{ maxWidth: 480, margin: '80px auto', padding: '0 24px', textAlign: 'center' }}>
+      <Card>
+        <h2 style={{ ...brandTitle(), fontSize: 22, marginTop: 0 }}>{m.title}</h2>
+        <p style={{ color: C.muted, fontSize: 14, lineHeight: 1.6 }}>{m.body}</p>
+        <button onClick={signOut} style={{ ...btnGhost(), marginTop: 16 }}>Sign out</button>
+      </Card>
+    </div>
+  );
+}
+
+// ============================================================
+// SIGN-IN MODAL — ported from furniture form
+// ============================================================
+function SignInModal({ onClose, onSignedIn }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setBusy(true);
+    try {
+      const session = await signIn(email.trim(), password);
+      if (!isArkeUser(session)) {
+        localStorage.removeItem(SESSION_KEY);
+        throw new Error('This tool is for @arkecreative.co.uk accounts only.');
+      }
+      onSignedIn(session);
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 380, textAlign: 'left', padding: '24px 24px 20px' }}>
+        <h2 style={{ ...brandTitle(), marginTop: 0, marginBottom: 4, fontSize: 22 }}>
+          Sign in
+        </h2>
+        <p style={{ color: C.muted, fontSize: 13, marginTop: 0, marginBottom: 20 }}>
+          Use your @arkecreative.co.uk email and password.
+        </p>
+        <form onSubmit={submit}>
+          <Field label="Email">
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+              autoFocus style={inp()} placeholder="you@arkecreative.co.uk" />
+          </Field>
+          <Field label="Password">
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={inp()} />
+          </Field>
+          {error && (
+            <div style={{ color: C.redStatus, fontSize: 13, marginBottom: 12 }}>{error}</div>
+          )}
+          <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+            <button type="submit" disabled={busy || !email || !password} style={btn(busy || !email || !password)}>
+              {busy ? 'Signing in…' : 'Sign in'}
+            </button>
+            <button type="button" onClick={onClose} style={btnGhost()}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SIGNED-IN SHELL — sidebar + main area
+// ============================================================
+function SignedInShell({ access, route, navigate, children }) {
+  const isEditor = access.role === 'editor';
+  return (
+    <div style={{ minHeight: '100vh', background: C.bg, display: 'flex' }}>
+      <Sidebar isEditor={isEditor} route={route} navigate={navigate} access={access} />
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        <TopBar access={access} />
+        <main style={{ flex: 1, padding: '24px 32px 80px' }}>
+          {children}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ isEditor, route, navigate, access }) {
+  const items = isEditor ? [
+    { id: 'cashflow', label: 'Cashflow', path: ['cashflow'] },
+    { id: 'projects', label: 'Projects', path: ['projects'] },
+    { id: 'debtors',  label: 'Debtors',  path: ['debtors'] },
+    { id: 'overheads',label: 'Overheads',path: ['overheads'] },
+    { id: 'settings', label: 'Settings', path: ['settings'] },
+  ] : [
+    { id: 'projects', label: 'My projects', path: ['projects'] },
+  ];
+
+  // Active item: match first path segment, plus '' or 'home' counts as cashflow for editors
+  const seg = route.path[0] || (isEditor ? 'cashflow' : 'projects');
+  return (
+    <aside style={{
+      width: 220, background: C.white, borderRight: `1px solid ${C.line}`,
+      padding: '20px 12px', display: 'flex', flexDirection: 'column',
+      position: 'sticky', top: 0, height: '100vh',
+    }}>
+      <a href="#/" style={{
+        fontSize: 26, color: C.red, fontWeight: 400, letterSpacing: '-0.01em',
+        textDecoration: 'none', padding: '0 8px 24px', display: 'block',
+      }}>arke</a>
+      <nav style={{ flex: 1 }}>
+        {items.map(it => {
+          const active = seg === it.id;
+          return (
+            <a key={it.id} href={buildHash(it.path)} className={`arke-sidebar-item ${active ? 'active' : ''}`}
+              style={{
+                display: 'block', padding: '10px 12px', borderRadius: 6,
+                textDecoration: 'none', color: active ? C.red : C.text,
+                fontSize: 14, fontWeight: active ? 600 : 500, marginBottom: 2,
+              }}>
+              {it.label}
+            </a>
+          );
+        })}
+      </nav>
+      <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, fontSize: 11, color: C.muted }}>
+        <div style={{ padding: '0 8px', marginBottom: 4 }}>Signed in as</div>
+        <div style={{ padding: '0 8px', color: C.text, fontWeight: 500, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {access.displayName || getEmail(access.session)}
+        </div>
+        <div style={{ padding: '0 8px', marginTop: 2, fontSize: 11 }}>
+          <span style={{
+            background: isEditor ? C.redLight : C.prussianLight,
+            color: isEditor ? C.red : C.prussian,
+            padding: '2px 6px', borderRadius: 8, fontWeight: 600,
+          }}>{isEditor ? 'Editor' : 'Contributor'}</span>
+        </div>
+        <button onClick={signOut} style={{
+          marginTop: 12, background: 'transparent', border: 'none', cursor: 'pointer',
+          color: C.muted, fontSize: 12, padding: '4px 8px', fontFamily: 'inherit',
+        }}>Sign out</button>
+      </div>
+    </aside>
+  );
+}
+
+function TopBar({ access }) {
+  // Header strip above main area. Intentionally minimal — the brand mark sits in
+  // the sidebar. Reserved for breadcrumbs / page-level actions later.
+  return (
+    <div style={{
+      background: C.white, borderBottom: `1px solid ${C.line}`,
+      padding: '12px 32px', minHeight: 22,
+    }}/>
+  );
+}
+
+// ============================================================
+// ROUTE STUBS — placeholders for Stage 2+
+// ============================================================
+function StubPage({ title, subtitle, children }) {
+  return (
+    <div style={{ maxWidth: 920 }}>
+      <h1 style={brandTitle()}>{title}</h1>
+      {subtitle && <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 24 }}>{subtitle}</p>}
+      <Card>
+        <div style={{ textAlign: 'center', color: C.muted, fontSize: 13, padding: '40px 20px' }}>
+          {children || 'Coming in a later stage.'}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function CashflowPage({ access })       { return <StubPage title="Master cashflow" subtitle="Weekly grid of money in and overheads out.">Cashflow grid — Stage 5.</StubPage>; }
+function ContributorHome({ access })    { return <StubPage title="My projects" subtitle="Projects you've been assigned to.">Contributor home — Stage 4.</StubPage>; }
+function ProjectsListStub({ access })   { return <StubPage title="Projects" subtitle={access.role === 'editor' ? 'All projects.' : 'Projects you have access to.'}>Project register — Stage 3.</StubPage>; }
+function NewProjectStub()               { return <StubPage title="New project" subtitle="Header → Payment type → Schedule → Done.">New project wizard — Stage 3.</StubPage>; }
+function ProjectDetailStub({ id })      { return <StubPage title="Project detail" subtitle={`Project ID: ${id}`}>Project detail — Stage 4.</StubPage>; }
+function DebtorListStub()               { return <StubPage title="Debtors" subtitle="Imported from CSV or added manually.">Debtor list — Stage 6.</StubPage>; }
+function DebtorImportStub()             { return <StubPage title="Import debtors" subtitle="Upload CSV, map columns, review, commit.">CSV import — Stage 6.</StubPage>; }
+function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
+function SettingsHubStub() {
+  return (
+    <StubPage title="Settings" subtitle="Manage users, categories, and CSV presets.">
+      <div style={{ display: 'grid', gap: 12, maxWidth: 360, margin: '0 auto', textAlign: 'left' }}>
+        <a href={buildHash(['settings','users'])} style={settingsLink()}>Users & access</a>
+        <a href={buildHash(['settings','categories'])} style={settingsLink()}>Overhead categories</a>
+        <a href={buildHash(['settings','csv-presets'])} style={settingsLink()}>CSV import presets</a>
+      </div>
+    </StubPage>
+  );
+}
+function SettingsUsersStub()          { return <StubPage title="Settings — Users" subtitle="Add and remove users, assign roles.">User management — Stage 2.</StubPage>; }
+function SettingsCategoriesStub()     { return <StubPage title="Settings — Categories" subtitle="Curate the overhead category list.">Category management — Stage 7.</StubPage>; }
+function SettingsCsvPresetsStub()     { return <StubPage title="Settings — CSV presets" subtitle="Saved column mappings for debtor uploads.">CSV preset management — Stage 6.</StubPage>; }
+
+function NotFound({ navigate }) {
+  return (
+    <div style={{ maxWidth: 480, margin: '60px auto', textAlign: 'center' }}>
+      <Card>
+        <h2 style={{ ...brandTitle(), fontSize: 22 }}>Page not found</h2>
+        <p style={{ color: C.muted, fontSize: 14 }}>The link you followed doesn't match anything in the app.</p>
+        <button onClick={() => navigate([], {}, false)} style={btn(false)}>Go home</button>
+      </Card>
+    </div>
+  );
+}
+
+// ============================================================
+// LAYOUT PRIMITIVES — ported from furniture form
+// ============================================================
+function Shell({ children, session }) {
+  return (
+    <div style={{ minHeight: '100vh', background: C.bg, fontFamily: 'inherit', color: C.text }}>
+      <header style={{
+        background: C.white, borderBottom: `1px solid ${C.line}`,
+        padding: '14px 32px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+      }}>
+        <a href="#/" style={{ fontSize: 26, color: C.red, fontWeight: 400, letterSpacing: '-0.01em', textDecoration: 'none' }}>arke</a>
+        {session && getEmail(session) && (
+          <span style={{ fontSize: 13, color: C.muted }}>{getEmail(session)}</span>
+        )}
+      </header>
+      {children}
+    </div>
+  );
+}
+
+function Card({ children }) {
+  return <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, padding: 24 }}>{children}</div>;
+}
+
+function Section({ title, children }) {
+  return (
+    <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, marginBottom: 20, overflow: 'hidden' }}>
+      <div style={{ padding: '12px 18px', background: C.red, color: C.white }}>
+        <div style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{title}</div>
+      </div>
+      <div style={{ padding: 18 }}>{children}</div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function Row({ children }) {
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>{children}</div>;
+}
+
+function FieldLabel({ children }) {
+  return <div style={{ width: 200, fontSize: 13, color: C.text, fontWeight: 500 }}>{children}</div>;
+}
+
+function ReadOnlyValue({ value }) {
+  return (
+    <div style={{
+      flex: 1, padding: '8px 10px', background: C.redSoft, border: `1px solid ${C.line}`,
+      borderRadius: 4, fontSize: 13, color: value && value !== '—' ? C.text : C.muted, fontWeight: 500,
+      fontVariantNumeric: 'tabular-nums', boxSizing: 'border-box', minWidth: 0,
+    }}>{value || '—'}</div>
+  );
+}
+
+function CopyButton({ text, label }) {
+  const [copied, setCopied] = useState(false);
+  const handleClick = async (e) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      alert('Could not copy: ' + err.message);
+    }
+  };
+  return (
+    <button onClick={handleClick} style={btnGhost()}>
+      {copied ? '✓ Copied' : (label || 'Copy')}
+    </button>
+  );
+}
+
+function LoadingMsg({ label }) {
+  return <div style={{ maxWidth: 600, margin: '80px auto', textAlign: 'center', color: C.muted }}>{label || 'Loading…'}</div>;
+}
+
+function ErrorMsg({ msg }) {
+  return (
+    <div style={{ maxWidth: 600, margin: '80px auto', padding: '0 32px', textAlign: 'center' }}>
+      <div style={{
+        background: C.redStatusLight, color: C.redStatus, padding: 20, borderRadius: 8,
+        fontSize: 14, borderLeft: `3px solid ${C.redStatus}`,
+      }}>{msg}</div>
+    </div>
+  );
+}
+
+// ============================================================
+// STYLE FUNCTIONS
+// ============================================================
+function brandTitle() {
+  return {
+    fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+    fontSize: 32, color: C.red, margin: '0 0 12px', letterSpacing: '-0.02em', fontWeight: 700,
+  };
+}
+
+function inp(disabled) {
+  return {
+    flex: 1, padding: '8px 10px',
+    border: `1px solid ${C.line}`, borderRadius: 4, fontSize: 13,
+    background: disabled ? '#F5F5F5' : C.white,
+    color: disabled ? C.muted : C.text,
+    fontFamily: 'inherit', width: '100%',
+    boxSizing: 'border-box', minWidth: 0,
+  };
+}
+
+function btn(disabled) {
+  return {
+    padding: '10px 18px', background: disabled ? C.line : C.red, color: C.white,
+    border: 'none', borderRadius: 6, cursor: disabled ? 'default' : 'pointer',
+    fontSize: 14, fontWeight: 600, fontFamily: 'inherit',
+  };
+}
+
+function btnGhost() {
+  return {
+    padding: '10px 18px', background: C.white, color: C.text,
+    border: `1px solid ${C.line}`, borderRadius: 6, cursor: 'pointer',
+    fontSize: 14, fontWeight: 600, fontFamily: 'inherit',
+  };
+}
+
+function settingsLink() {
+  return {
+    display: 'block', padding: '12px 16px', border: `1px solid ${C.line}`,
+    borderRadius: 6, textDecoration: 'none', color: C.text, fontSize: 14,
+    fontWeight: 500, background: C.white,
+  };
+}
+
+// ============================================================
+// MOUNT
+// ============================================================
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+requestAnimationFrame(() => {
+  setTimeout(() => {
+    const splash = document.getElementById('splash');
+    if (splash) {
+      splash.classList.add('hide');
+      setTimeout(() => splash.remove(), 350);
+    }
+  }, 100);
+});
+</script>
+</body>
+</html>
