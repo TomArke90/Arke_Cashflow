@@ -1529,11 +1529,12 @@ function StageRowEditor({ row, mode, project, projectValue, onChange, onRemove }
         min={startDate || undefined}
         warning={invoiceWarning}
       />
-      <DateField
+      <OverrideDateField
         value={row.payment_date_override}
+        defaultValue={computedPayment}
         onChange={(v) => onChange('payment_date_override', v)}
+        defaultHintText={`payment terms (+${terms} days)`}
         min={row.invoice_date || undefined}
-        hint={computedPayment ? `auto: ${fmtDateShort(computedPayment)} (+${terms}d)` : `+${terms}d after invoice`}
         warning={paymentBeforeInvoice ? 'Before invoice date' : null}
         error={paymentBeforeInvoice}
       />
@@ -1794,11 +1795,12 @@ function ValuationRowEditor({ row, project, onChange, onRemove }) {
         min={startDate || undefined}
         warning={invoiceWarning}
       />
-      <DateField
+      <OverrideDateField
         value={row.payment_date_override}
+        defaultValue={computedPayment}
         onChange={(v) => onChange('payment_date_override', v)}
+        defaultHintText={`payment terms (+${terms} days)`}
         min={row.invoice_date || undefined}
-        hint={computedPayment ? `auto: ${fmtDateShort(computedPayment)} (+${terms}d)` : `+${terms}d after invoice`}
         warning={paymentBeforeInvoice ? 'Before invoice date' : null}
         error={paymentBeforeInvoice}
       />
@@ -1927,6 +1929,138 @@ function DateField({ value, onChange, disabled, min, max, hint, warning, error }
       )}
     </div>
   );
+}
+
+// OverrideDateField — three-state input for payment date overrides.
+//   value           = the saved override (string '' if none)
+//   defaultValue    = the computed default to show when no override is set
+//   defaultHintText = the explanatory line under the field (e.g. "payment terms (+30 days)")
+//   min             = lower bound on the date picker (e.g. invoice_date)
+//   warning/error   = passed through to the warning line below the field
+// States:
+//   1. Default      — value empty. Shows defaultValue greyed-out & read-only, pencil icon to edit.
+//   2. Editing      — pencil just clicked; input becomes a regular date picker pre-filled with default.
+//                     Revert × visible. Picker stays "active" until blur away from the row.
+//   3. Overridden   — value set, not in editing mode. Black text, pencil + revert, "was DEFAULT" line.
+function OverrideDateField({ value, defaultValue, onChange, defaultHintText, min, warning, error }) {
+  const [isEditing, setIsEditing] = useState(false);
+
+  const hasOverride = !!value;
+  // Drop out of editing mode when the user clears the override
+  useEffect(() => {
+    if (!hasOverride && isEditing) setIsEditing(false);
+  }, [hasOverride, isEditing]);
+
+  const startEditing = () => {
+    // Seed the override with the default so the picker has something sensible.
+    // If user then changes it, that's the new override; if they don't, revert
+    // returns it to empty.
+    if (!hasOverride && defaultValue) {
+      onChange(defaultValue);
+    }
+    setIsEditing(true);
+  };
+
+  const revert = () => {
+    onChange('');
+    setIsEditing(false);
+  };
+
+  const showAsEditable = isEditing || hasOverride;
+
+  // ICON BUTTONS shared across states
+  const PencilButton = (
+    <button
+      type="button"
+      onClick={startEditing}
+      title="Override payment date"
+      style={iconBtn()}
+    >
+      ✎
+    </button>
+  );
+  const RevertButton = (
+    <button
+      type="button"
+      onClick={revert}
+      title="Use payment terms default"
+      style={{ ...iconBtn(), color: C.redStatus }}
+    >
+      ✕
+    </button>
+  );
+
+  return (
+    <div style={{ minWidth: 0 }}>
+      <div style={{ display: 'flex', gap: 4, alignItems: 'stretch' }}>
+        {showAsEditable ? (
+          // States 2 & 3 — real editable date picker
+          <input
+            type="date"
+            value={value || defaultValue || ''}
+            onChange={(e) => onChange(e.target.value)}
+            min={min || undefined}
+            autoFocus={isEditing && !hasOverride}
+            style={{
+              ...inp(false), fontFamily: 'inherit', flex: 1,
+              // Once overridden the text is black; in editing mode it's also black
+              color: C.text, fontWeight: 500,
+            }}
+          />
+        ) : (
+          // State 1 — default. Read-only-looking, greyed out, click toggles edit
+          <div
+            onClick={startEditing}
+            style={{
+              ...inp(true), flex: 1, cursor: 'pointer',
+              fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums',
+              display: 'flex', alignItems: 'center',
+              color: C.muted, background: C.bg,
+            }}
+            title="Click pencil to override"
+          >
+            {defaultValue ? fmtDateShort(defaultValue) : '—'}
+          </div>
+        )}
+        {hasOverride ? (
+          <React.Fragment>
+            {!isEditing && PencilButton}
+            {RevertButton}
+          </React.Fragment>
+        ) : (
+          PencilButton
+        )}
+      </div>
+
+      {/* Sub-line: defaultHintText in state 1, "was X" in state 3 (or 2 if user has typed) */}
+      {!hasOverride && defaultHintText && (
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 3, fontStyle: 'italic' }}>
+          {defaultHintText}
+        </div>
+      )}
+      {hasOverride && (
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 3, fontStyle: 'italic' }}>
+          overridden — default was {defaultValue ? fmtDateShort(defaultValue) : '—'}
+        </div>
+      )}
+
+      {warning && (
+        <div style={{ fontSize: 11, color: error ? C.redStatus : C.amber, marginTop: 3, fontWeight: 500 }}>
+          ⚠ {warning}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function iconBtn() {
+  return {
+    width: 30, padding: '0', background: C.white, color: C.muted,
+    border: `1px solid ${C.line}`, borderRadius: 4, cursor: 'pointer',
+    fontFamily: 'inherit', fontSize: 14, fontWeight: 600,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    flexShrink: 0,
+  };
 }
 
 function NumberInput({ value, onChange, step, placeholder, align, disabled }) {
