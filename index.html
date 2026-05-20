@@ -296,6 +296,33 @@ function timeAgo(iso) {
   return Math.floor(sec / (86400 * 365)) + 'y';
 }
 
+// Add `days` days to an ISO date string (YYYY-MM-DD), returning a new ISO date.
+// Returns '' if input is missing or invalid. Days can be negative.
+function addDays(iso, days) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return '';
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+// Compare two ISO dates (YYYY-MM-DD). Returns -1/0/1. Missing dates compare as 0.
+function cmpDate(a, b) {
+  if (!a || !b) return 0;
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+// Format an ISO date as a short label, e.g. "15 Aug 2026". Used in placeholders
+// where space is tight. Empty input → ''.
+function fmtDateShort(iso) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
 // ============================================================
 // HASH ROUTING — new for this app
 // Path: #/projects/abc?tab=schedule  =>
@@ -1010,7 +1037,16 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const valid = form.name && form.name.trim().length > 0 && Number(form.value) >= 0;
+  // Date validation. End-before-start and retention-before-end are both
+  // category errors — hard blocks on save.
+  const endBeforeStart = form.start_date && form.end_date && cmpDate(form.end_date, form.start_date) < 0;
+  const retentionBeforeEnd = form.end_date && form.retention_date && cmpDate(form.retention_date, form.end_date) < 0;
+
+  const valid =
+    form.name && form.name.trim().length > 0
+    && Number(form.value) >= 0
+    && !endBeforeStart
+    && !retentionBeforeEnd;
 
   const update = (field, val) => setForm(prev => ({ ...prev, [field]: val }));
 
@@ -1080,13 +1116,29 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
 
       <div style={threeCol()}>
         <Field label="Start date">
-          <DateInput value={form.start_date} onChange={(v) => update('start_date', v)} />
+          <DateField
+            value={form.start_date}
+            onChange={(v) => update('start_date', v)}
+          />
         </Field>
         <Field label="End date">
-          <DateInput value={form.end_date} onChange={(v) => update('end_date', v)} />
+          <DateField
+            value={form.end_date}
+            onChange={(v) => update('end_date', v)}
+            min={form.start_date || undefined}
+            warning={endBeforeStart ? 'End date must be on or after start date' : null}
+            error={endBeforeStart}
+          />
         </Field>
         <Field label="Retention release date">
-          <DateInput value={form.retention_date} onChange={(v) => update('retention_date', v)} />
+          <DateField
+            value={form.retention_date}
+            onChange={(v) => update('retention_date', v)}
+            min={form.end_date || form.start_date || undefined}
+            hint={form.end_date ? `Typically ~12 months after end (${fmtDateShort(addDays(form.end_date, 365))})` : 'After end of defects period'}
+            warning={retentionBeforeEnd ? 'Retention is released after project end' : null}
+            error={retentionBeforeEnd}
+          />
         </Field>
       </div>
 
@@ -1329,6 +1381,9 @@ function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
     if (!validSum) { setError('Stages must sum to exactly 100%.'); return; }
     if (rows.length === 0) { setError('Add at least one stage.'); return; }
     if (rows.some(r => !r.invoice_date)) { setError('Every stage needs an invoice date.'); return; }
+    // Hard block: payment date override (when set) must not be before invoice date.
+    const bad = rows.find(r => r.payment_date_override && cmpDate(r.payment_date_override, r.invoice_date) < 0);
+    if (bad) { setError(`Stage ${bad.sequence}: payment date is before the invoice date.`); return; }
     setBusy(true); setError('');
     try {
       // Wipe and rewrite — simplest reliable approach for a wizard.
@@ -1390,6 +1445,7 @@ function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
               key={r._key}
               row={r}
               mode={mode}
+              project={project}
               projectValue={projectValue}
               onChange={(field, value) => updateRow(r._key, field, value)}
               onRemove={() => removeRow(r._key)}
@@ -1438,19 +1494,49 @@ function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
   );
 }
 
-function StageRowEditor({ row, mode, projectValue, onChange, onRemove }) {
+function StageRowEditor({ row, mode, project, projectValue, onChange, onRemove }) {
   const valueShown = mode === 'pct'
     ? row.invoice_pct
     : (row.invoice_pct === '' ? '' : (Number(row.invoice_pct) / 100 * projectValue));
 
+  // Date validation & hints
+  const terms = Number(project.payment_terms_days) || 30;
+  const startDate = project.start_date || null;
+  const endDate = project.end_date || null;
+  const computedPayment = row.invoice_date ? addDays(row.invoice_date, terms) : '';
+
+  // Warnings (soft, do not block save)
+  let invoiceWarning = null;
+  if (row.invoice_date && startDate && cmpDate(row.invoice_date, startDate) < 0) {
+    invoiceWarning = 'Before project start';
+  } else if (row.invoice_date && endDate && cmpDate(row.invoice_date, endDate) > 0) {
+    invoiceWarning = 'After project end';
+  }
+  // Hard error (used by save logic in parent — also flagged in UI)
+  const paymentBeforeInvoice =
+    row.payment_date_override && row.invoice_date
+    && cmpDate(row.payment_date_override, row.invoice_date) < 0;
+
   return (
     <div style={{
       display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
-      gap: 8, padding: '6px 4px', alignItems: 'center',
+      gap: 8, padding: '6px 4px', alignItems: 'flex-start',
     }}>
-      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{row.sequence}</div>
-      <DateInput value={row.invoice_date} onChange={(v) => onChange('invoice_date', v)} />
-      <DateInput value={row.payment_date_override} onChange={(v) => onChange('payment_date_override', v)} placeholder="(auto)" />
+      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600, paddingTop: 8 }}>{row.sequence}</div>
+      <DateField
+        value={row.invoice_date}
+        onChange={(v) => onChange('invoice_date', v)}
+        min={startDate || undefined}
+        warning={invoiceWarning}
+      />
+      <DateField
+        value={row.payment_date_override}
+        onChange={(v) => onChange('payment_date_override', v)}
+        min={row.invoice_date || undefined}
+        hint={computedPayment ? `auto: ${fmtDateShort(computedPayment)} (+${terms}d)` : `+${terms}d after invoice`}
+        warning={paymentBeforeInvoice ? 'Before invoice date' : null}
+        error={paymentBeforeInvoice}
+      />
       <NumberInput
         value={valueShown}
         onChange={(v) => onChange('invoice_pct', v)}
@@ -1583,6 +1669,8 @@ function ValuationScheduleEditor({ access, project, setProject, onBack, onNext }
     if (rows.some(r => r.invoice_value_net === '' || Number(r.invoice_value_net) <= 0)) {
       setError('Every claim needs a positive value.'); return;
     }
+    const bad = rows.find(r => r.payment_date_override && cmpDate(r.payment_date_override, r.invoice_date) < 0);
+    if (bad) { setError(`Claim ${bad.sequence}: payment date is before the invoice date.`); return; }
     setBusy(true); setError('');
     try {
       await sbDelete('project_invoices', `project_id=eq.${project.id}`, access.session);
@@ -1635,6 +1723,7 @@ function ValuationScheduleEditor({ access, project, setProject, onBack, onNext }
           {rows.map(r => (
             <ValuationRowEditor
               key={r._key} row={r}
+              project={project}
               onChange={(field, value) => updateRow(r._key, field, value)}
               onRemove={() => removeRow(r._key)}
             />
@@ -1677,15 +1766,42 @@ function ValuationScheduleEditor({ access, project, setProject, onBack, onNext }
   );
 }
 
-function ValuationRowEditor({ row, onChange, onRemove }) {
+function ValuationRowEditor({ row, project, onChange, onRemove }) {
+  const terms = Number(project.payment_terms_days) || 30;
+  const startDate = project.start_date || null;
+  const endDate = project.end_date || null;
+  const computedPayment = row.invoice_date ? addDays(row.invoice_date, terms) : '';
+
+  let invoiceWarning = null;
+  if (row.invoice_date && startDate && cmpDate(row.invoice_date, startDate) < 0) {
+    invoiceWarning = 'Before project start';
+  } else if (row.invoice_date && endDate && cmpDate(row.invoice_date, endDate) > 0) {
+    invoiceWarning = 'After project end';
+  }
+  const paymentBeforeInvoice =
+    row.payment_date_override && row.invoice_date
+    && cmpDate(row.payment_date_override, row.invoice_date) < 0;
+
   return (
     <div style={{
       display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
-      gap: 8, padding: '6px 4px', alignItems: 'center',
+      gap: 8, padding: '6px 4px', alignItems: 'flex-start',
     }}>
-      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{row.sequence}</div>
-      <DateInput value={row.invoice_date} onChange={(v) => onChange('invoice_date', v)} />
-      <DateInput value={row.payment_date_override} onChange={(v) => onChange('payment_date_override', v)} placeholder="(auto)" />
+      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600, paddingTop: 8 }}>{row.sequence}</div>
+      <DateField
+        value={row.invoice_date}
+        onChange={(v) => onChange('invoice_date', v)}
+        min={startDate || undefined}
+        warning={invoiceWarning}
+      />
+      <DateField
+        value={row.payment_date_override}
+        onChange={(v) => onChange('payment_date_override', v)}
+        min={row.invoice_date || undefined}
+        hint={computedPayment ? `auto: ${fmtDateShort(computedPayment)} (+${terms}d)` : `+${terms}d after invoice`}
+        warning={paymentBeforeInvoice ? 'Before invoice date' : null}
+        error={paymentBeforeInvoice}
+      />
       <NumberInput value={row.invoice_value_net} onChange={(v) => onChange('invoice_value_net', v)} step="0.01" align="right" />
       <input value={row.notes} onChange={(e) => onChange('notes', e.target.value)} style={inp()} placeholder="Optional" />
       <button onClick={onRemove} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
@@ -1774,7 +1890,11 @@ function WizardStep4Done({ access, project, setProject, onBack, onFinish }) {
 // ============================================================
 // FORM PRIMITIVES (new in Stage 3)
 // ============================================================
-function DateInput({ value, onChange, placeholder, disabled }) {
+function DateInput({ value, onChange, placeholder, disabled, min, max }) {
+  // <input type="date"> ignores the `placeholder` attribute in every browser
+  // (W3C quirk). For "auto: 15 Aug 2026" style hints, use <DateField> instead,
+  // which renders the hint below the input. The placeholder prop here is kept
+  // for API symmetry only; effectively a no-op.
   return (
     <input
       type="date"
@@ -1782,8 +1902,30 @@ function DateInput({ value, onChange, placeholder, disabled }) {
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
       placeholder={placeholder}
+      min={min || undefined}
+      max={max || undefined}
       style={{ ...inp(disabled), fontFamily: 'inherit' }}
     />
+  );
+}
+
+// DateField — a DateInput with optional hint (sub-label) and warning (red).
+// `hint` is shown when value is empty and a default would apply.
+// `warning` is shown when the chosen value is outside the allowed range.
+// If `error` is true the warning text shows in red; otherwise amber.
+function DateField({ value, onChange, disabled, min, max, hint, warning, error }) {
+  return (
+    <div style={{ minWidth: 0 }}>
+      <DateInput value={value} onChange={onChange} disabled={disabled} min={min} max={max} />
+      {(!value && hint) && (
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 3, fontStyle: 'italic' }}>{hint}</div>
+      )}
+      {warning && (
+        <div style={{ fontSize: 11, color: error ? C.redStatus : C.amber, marginTop: 3, fontWeight: 500 }}>
+          ⚠ {warning}
+        </div>
+      )}
+    </div>
   );
 }
 
