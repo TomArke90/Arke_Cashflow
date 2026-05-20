@@ -60,13 +60,16 @@
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 // ============================================================
-// CONFIG — replace these with your fresh Supabase project values
+// CONFIG — Supabase project: drijoaczyyilwxmtneqa
 // ============================================================
 const SUPABASE_URL = 'https://drijoaczyyilwxmtneqa.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRyaWpvYWN6eXlpbHd4bXRuZXFhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyODMzNTUsImV4cCI6MjA5NDg1OTM1NX0.EF-MMOM5fLXCaIbVVw1k7vROX3oP2IZOjAQOTk9m3Ik';
 const ARKE_DOMAIN = '@arkecreative.co.uk';
 const SESSION_KEY = 'arke_cashflow_session';
 const PREFS_KEY = 'arke_cashflow_prefs';
+// Edge Functions live on the /functions/v1/<name> path of the project URL.
+// We derive rather than hardcode so updating SUPABASE_URL is the only edit needed.
+const EDGE_FN = (name) => `${SUPABASE_URL}/functions/v1/${name}`;
 
 // ============================================================
 // BRAND PALETTE (per Arke Brand Guidelines)
@@ -207,6 +210,29 @@ async function sbDelete(table, query, session) {
   });
   if (!r.ok) throw new Error(`Delete failed: ${r.status} ${await r.text()}`);
   return r.status === 204 ? null : r.json();
+}
+
+// Call a Supabase Edge Function with the user's JWT. Used for privileged
+// operations (creating auth users, resetting passwords) that the anon key
+// can't do on its own.
+async function callEdgeFunction(name, body, session) {
+  if (!session || !session.access_token) {
+    throw new Error('Not signed in');
+  }
+  const r = await fetch(EDGE_FN(name), {
+    method: 'POST',
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${session.access_token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await r.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : {}; } catch (e) { payload = { error: text }; }
+  if (!r.ok) throw new Error(payload.error || `Edge function ${name} failed (${r.status})`);
+  return payload;
 }
 
 // ============================================================
@@ -428,10 +454,10 @@ function RouteSwitch({ route, navigate, access }) {
   }
   if (seg === 'overheads') return <OverheadListStub />;
   if (seg === 'settings') {
-    if (route.path[1] === 'users') return <SettingsUsersStub />;
+    if (route.path[1] === 'users') return <SettingsUsersPage access={access} />;
     if (route.path[1] === 'categories') return <SettingsCategoriesStub />;
     if (route.path[1] === 'csv-presets') return <SettingsCsvPresetsStub />;
-    return <SettingsHubStub />;
+    return <SettingsHub access={access} />;
   }
   return <NotFound navigate={navigate} />;
 }
@@ -659,18 +685,619 @@ function ProjectDetailStub({ id })      { return <StubPage title="Project detail
 function DebtorListStub()               { return <StubPage title="Debtors" subtitle="Imported from CSV or added manually.">Debtor list — Stage 6.</StubPage>; }
 function DebtorImportStub()             { return <StubPage title="Import debtors" subtitle="Upload CSV, map columns, review, commit.">CSV import — Stage 6.</StubPage>; }
 function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
-function SettingsHubStub() {
+
+function SettingsHub({ access }) {
   return (
-    <StubPage title="Settings" subtitle="Manage users, categories, and CSV presets.">
-      <div style={{ display: 'grid', gap: 12, maxWidth: 360, margin: '0 auto', textAlign: 'left' }}>
-        <a href={buildHash(['settings','users'])} style={settingsLink()}>Users & access</a>
-        <a href={buildHash(['settings','categories'])} style={settingsLink()}>Overhead categories</a>
-        <a href={buildHash(['settings','csv-presets'])} style={settingsLink()}>CSV import presets</a>
+    <div style={{ maxWidth: 720 }}>
+      <h1 style={brandTitle()}>Settings</h1>
+      <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 24 }}>
+        Manage users, overhead categories, and CSV import presets.
+      </p>
+      <div style={{ display: 'grid', gap: 12, gridTemplateColumns: '1fr 1fr', maxWidth: 600 }}>
+        <SettingsCard
+          href={buildHash(['settings','users'])}
+          title="Users & access"
+          description="Add team members, assign roles, deactivate accounts."
+        />
+        <SettingsCard
+          href={buildHash(['settings','categories'])}
+          title="Overhead categories"
+          description="Curate the category list used to group overheads on the cashflow grid."
+          disabled
+          badge="Stage 7"
+        />
+        <SettingsCard
+          href={buildHash(['settings','csv-presets'])}
+          title="CSV import presets"
+          description="Saved column mappings for repeated debtor uploads."
+          disabled
+          badge="Stage 6"
+        />
       </div>
-    </StubPage>
+    </div>
   );
 }
-function SettingsUsersStub()          { return <StubPage title="Settings — Users" subtitle="Add and remove users, assign roles.">User management — Stage 2.</StubPage>; }
+
+function SettingsCard({ href, title, description, disabled, badge }) {
+  const content = (
+    <div style={{
+      padding: 16, background: C.white, border: `1px solid ${C.line}`,
+      borderRadius: 8, cursor: disabled ? 'default' : 'pointer',
+      opacity: disabled ? 0.55 : 1, height: '100%', boxSizing: 'border-box',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>{title}</div>
+        {badge && (
+          <span style={{ background: C.amberLight, color: C.amber, fontSize: 10, padding: '2px 6px', borderRadius: 8, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            {badge}
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5 }}>{description}</div>
+    </div>
+  );
+  if (disabled) return content;
+  return <a href={href} style={{ textDecoration: 'none' }}>{content}</a>;
+}
+
+// ============================================================
+// SETTINGS — USERS PAGE
+// ============================================================
+function SettingsUsersPage({ access }) {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState(null);
+  const [showInvite, setShowInvite] = useState(false);
+  const [resetTarget, setResetTarget] = useState(null);
+  const [confirm, setConfirm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [flash, setFlash] = useState(null); // { kind: 'ok'|'err', msg: string }
+
+  const refetch = useCallback(async () => {
+    try {
+      const rows = await sbSelect('cashflow_users',
+        'select=*&order=role.asc,added_at.desc', access.session);
+      setUsers(rows);
+    } catch (e) { setError(e.message); }
+  }, [access.session]);
+
+  useEffect(() => { refetch(); }, [refetch]);
+
+  const showFlash = (kind, msg) => {
+    setFlash({ kind, msg });
+    setTimeout(() => setFlash(null), 5000);
+  };
+
+  // Cached: how many active editors exist? Used to disable destructive actions
+  // that would leave the system with no editors.
+  const activeEditorCount = useMemo(() => {
+    if (!users) return 0;
+    return users.filter(u => u.role === 'editor' && u.active).length;
+  }, [users]);
+
+  const myUserId = access.session && access.session.user && access.session.user.id;
+
+  const toggleActive = async (u) => {
+    // Guardrails
+    if (u.user_id === myUserId && u.active) {
+      showFlash('err', 'You cannot deactivate your own account.');
+      return;
+    }
+    if (u.active && u.role === 'editor' && activeEditorCount === 1) {
+      showFlash('err', 'Cannot deactivate the last active editor.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await sbUpdate('cashflow_users', `id=eq.${u.id}`, { active: !u.active }, access.session);
+      showFlash('ok', `${u.email} ${!u.active ? 'reactivated' : 'deactivated'}.`);
+      await refetch();
+    } catch (e) {
+      showFlash('err', 'Could not update: ' + e.message);
+    } finally { setBusy(false); }
+  };
+
+  const changeRole = async (u, newRole) => {
+    if (u.user_id === myUserId && u.role === 'editor' && newRole === 'contributor') {
+      showFlash('err', 'You cannot demote yourself.');
+      return;
+    }
+    if (u.role === 'editor' && newRole === 'contributor' && u.active && activeEditorCount === 1) {
+      showFlash('err', 'Cannot demote the last active editor.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await sbUpdate('cashflow_users', `id=eq.${u.id}`, { role: newRole }, access.session);
+      showFlash('ok', `${u.email} is now a ${newRole}.`);
+      await refetch();
+    } catch (e) {
+      showFlash('err', 'Could not change role: ' + e.message);
+    } finally { setBusy(false); }
+  };
+
+  const deleteUser = async (u) => {
+    setBusy(true);
+    try {
+      await callEdgeFunction('manage-users', {
+        action: 'delete',
+        user_id: u.user_id,
+      }, access.session);
+      showFlash('ok', `${u.email} removed.`);
+      await refetch();
+    } catch (e) {
+      showFlash('err', 'Could not remove: ' + e.message);
+    } finally {
+      setBusy(false);
+      setConfirm(null);
+    }
+  };
+
+  if (error) return <ErrorMsg msg={error} />;
+
+  return (
+    <div style={{ maxWidth: 920 }}>
+      <BackLink href={buildHash(['settings'])}>Settings</BackLink>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h1 style={brandTitle()}>Users & access</h1>
+          <p style={{ color: C.muted, fontSize: 14, margin: 0 }}>
+            Editors can do everything. Contributors only see projects they're assigned to.
+          </p>
+        </div>
+        <button onClick={() => setShowInvite(true)} style={btn(busy)}>
+          + Invite user
+        </button>
+      </div>
+
+      {flash && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 16, borderRadius: 6,
+          background: flash.kind === 'ok' ? C.greenLight : C.redStatusLight,
+          color: flash.kind === 'ok' ? C.green : C.redStatus,
+          borderLeft: `3px solid ${flash.kind === 'ok' ? C.green : C.redStatus}`,
+          fontSize: 13,
+        }}>{flash.msg}</div>
+      )}
+
+      {users === null ? <LoadingMsg label="Loading users…" /> : (
+        <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1.5fr 1.2fr',
+            gap: 12, padding: '12px 18px', background: C.redSoft,
+            borderBottom: `1px solid ${C.line}`,
+            fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>User</div>
+            <div>Role</div>
+            <div>Status</div>
+            <div>Added</div>
+            <div style={{ textAlign: 'right' }}>Actions</div>
+          </div>
+          {users.length === 0 && (
+            <div style={{ padding: 40, textAlign: 'center', color: C.muted, fontSize: 13 }}>
+              No users yet. Click "Invite user" to add the first.
+            </div>
+          )}
+          {users.map(u => (
+            <UserRow
+              key={u.id}
+              user={u}
+              isSelf={u.user_id === myUserId}
+              activeEditorCount={activeEditorCount}
+              busy={busy}
+              onToggleActive={() => toggleActive(u)}
+              onChangeRole={(r) => changeRole(u, r)}
+              onResetPassword={() => setResetTarget(u)}
+              onDelete={() => setConfirm({
+                title: 'Remove user',
+                message: `Permanently remove ${u.email}? They'll lose access immediately. Their record will be deleted from auth and the cashflow user list. Project history isn't affected.`,
+                confirmLabel: 'Remove',
+                destructive: true,
+                onConfirm: () => deleteUser(u),
+              })}
+            />
+          ))}
+        </div>
+      )}
+
+      {showInvite && (
+        <InviteUserModal
+          session={access.session}
+          onClose={() => setShowInvite(false)}
+          onCreated={async (msg) => { showFlash('ok', msg); await refetch(); }}
+        />
+      )}
+      {resetTarget && (
+        <ResetPasswordModal
+          session={access.session}
+          target={resetTarget}
+          onClose={() => setResetTarget(null)}
+          onDone={(msg) => { showFlash('ok', msg); setResetTarget(null); }}
+        />
+      )}
+      {confirm && (
+        <ConfirmModal
+          {...confirm}
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function UserRow({ user, isSelf, activeEditorCount, busy, onToggleActive, onChangeRole, onResetPassword, onDelete }) {
+  const roleBadge = user.role === 'editor'
+    ? { bg: C.redLight, fg: C.red, label: 'Editor' }
+    : { bg: C.prussianLight, fg: C.prussian, label: 'Contributor' };
+  const statusBadge = user.active
+    ? { bg: C.greenLight, fg: C.green, label: 'Active' }
+    : { bg: C.line, fg: C.muted, label: 'Deactivated' };
+
+  // Guardrails for the role dropdown
+  const cantDemote =
+    isSelf
+    || (user.role === 'editor' && user.active && activeEditorCount === 1);
+  const cantDeactivate =
+    isSelf
+    || (user.role === 'editor' && user.active && activeEditorCount === 1);
+
+  return (
+    <div style={{
+      display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1.5fr 1.2fr',
+      gap: 12, padding: '14px 18px', borderBottom: `1px solid ${C.line}`,
+      alignItems: 'center', fontSize: 13,
+    }}>
+      <div>
+        <div style={{ fontWeight: 600, marginBottom: 2 }}>
+          {user.display_name || user.email}
+          {isSelf && <span style={{ marginLeft: 6, fontSize: 10, color: C.muted, fontWeight: 500 }}>(you)</span>}
+        </div>
+        {user.display_name && (
+          <div style={{ fontSize: 11, color: C.muted }}>{user.email}</div>
+        )}
+      </div>
+      <div>
+        <select
+          value={user.role}
+          onChange={(e) => onChangeRole(e.target.value)}
+          disabled={busy || (cantDemote && user.role === 'editor')}
+          style={{ ...inp(busy), padding: '6px 8px', fontSize: 12 }}
+        >
+          <option value="editor">Editor</option>
+          <option value="contributor">Contributor</option>
+        </select>
+      </div>
+      <div>
+        <span style={{
+          background: statusBadge.bg, color: statusBadge.fg,
+          padding: '3px 10px', borderRadius: 10,
+          fontSize: 11, fontWeight: 600,
+        }}>
+          ● {statusBadge.label}
+        </span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted }}>
+        {timeAgo(user.added_at)}
+        {user.added_by_email && <div style={{ fontSize: 11 }}>by {user.added_by_email}</div>}
+      </div>
+      <div style={{ textAlign: 'right', display: 'flex', gap: 6, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+        <button
+          onClick={onToggleActive}
+          disabled={busy || (user.active && cantDeactivate)}
+          style={{ ...miniBtn(), color: user.active ? C.amber : C.green }}
+          title={cantDeactivate && user.active ? 'Cannot deactivate the last active editor or yourself' : ''}
+        >
+          {user.active ? 'Deactivate' : 'Reactivate'}
+        </button>
+        <button onClick={onResetPassword} disabled={busy || isSelf} style={miniBtn()} title={isSelf ? 'Use your account settings to change your own password' : ''}>
+          Reset pw
+        </button>
+        <button onClick={onDelete} disabled={busy || isSelf} style={{ ...miniBtn(), color: C.redStatus }}>
+          Remove
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// INVITE USER MODAL
+// ============================================================
+function InviteUserModal({ session, onClose, onCreated }) {
+  const [email, setEmail] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [role, setRole] = useState('contributor');
+  const [password, setPassword] = useState(generateMemorablePassword());
+  const [showPassword, setShowPassword] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [done, setDone] = useState(null); // { email, password }
+
+  // Email validation: just the Arke domain + a sensible local part.
+  const emailValid = /^[^\s@]+@arkecreative\.co\.uk$/i.test(email.trim());
+  const canSubmit = emailValid && password.length >= 8 && !busy;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!canSubmit) return;
+    setError(''); setBusy(true);
+    try {
+      await callEdgeFunction('manage-users', {
+        action: 'create',
+        email: email.trim().toLowerCase(),
+        display_name: displayName.trim() || null,
+        role,
+        password,
+      }, session);
+      // Hold the modal open at a "done" screen showing the credentials once.
+      setDone({ email: email.trim().toLowerCase(), password });
+      onCreated(`Invited ${email.trim().toLowerCase()} as ${role}.`);
+    } catch (err) {
+      setError(err.message);
+    } finally { setBusy(false); }
+  };
+
+  if (done) {
+    return (
+      <div className="arke-modal-backdrop" onClick={onClose}>
+        <div className="arke-modal" onClick={(e) => e.stopPropagation()}>
+          <h2 style={{ ...brandTitle(), marginTop: 0, fontSize: 22 }}>✓ User created</h2>
+          <p style={{ color: C.muted, fontSize: 13, marginBottom: 16 }}>
+            Send these credentials to the user out-of-band (Slack DM, in person, etc).
+            The password is shown once — copy it now, we can't recover it later.
+          </p>
+          <Field label="Email">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input readOnly value={done.email} onFocus={(e) => e.target.select()} style={{ ...inp(), fontFamily: 'monospace', fontSize: 12 }} />
+              <CopyButton text={done.email} />
+            </div>
+          </Field>
+          <Field label="Password (shown once)">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input readOnly value={done.password} onFocus={(e) => e.target.select()} style={{ ...inp(), fontFamily: 'monospace', fontSize: 16, letterSpacing: '0.05em' }} />
+              <CopyButton text={done.password} />
+            </div>
+          </Field>
+          <div style={{ background: C.amberLight, padding: 12, borderRadius: 6, fontSize: 12, marginTop: 12, borderLeft: `3px solid ${C.amber}` }}>
+            Once this dialog closes, the password is gone. The user can change it after signing in, or you can reset it from the Users page if it goes missing.
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 18 }}>
+            <button onClick={onClose} style={btn(false)}>Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()}>
+        <h2 style={{ ...brandTitle(), marginTop: 0, fontSize: 22 }}>Invite user</h2>
+        <p style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
+          Creates the user with the password you set. Send them the credentials separately.
+        </p>
+        <form onSubmit={submit}>
+          <Field label="Arke email">
+            <input
+              type="email" value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoFocus style={inp()}
+              placeholder="firstname@arkecreative.co.uk"
+            />
+            {email && !emailValid && (
+              <div style={{ color: C.redStatus, fontSize: 12, marginTop: 4 }}>
+                Must end in {ARKE_DOMAIN}
+              </div>
+            )}
+          </Field>
+          <Field label="Display name (optional)">
+            <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} style={inp()} placeholder="First Last" />
+          </Field>
+          <Field label="Role">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <RoleOption selected={role === 'contributor'} onClick={() => setRole('contributor')} label="Contributor" description="Project access only" />
+              <RoleOption selected={role === 'editor'} onClick={() => setRole('editor')} label="Editor" description="Full access" />
+            </div>
+          </Field>
+          <Field label="Password (≥ 8 characters)">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={{ ...inp(), fontFamily: 'monospace' }}
+              />
+              <button type="button" onClick={() => setPassword(generateMemorablePassword())} style={btnGhost()} title="Regenerate">↻</button>
+              <button type="button" onClick={() => setShowPassword(s => !s)} style={btnGhost()}>
+                {showPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+              Auto-generated. Editable.
+            </div>
+          </Field>
+          {error && (
+            <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+              {error}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+            <button type="button" onClick={onClose} style={btnGhost()}>Cancel</button>
+            <button type="submit" disabled={!canSubmit} style={btn(!canSubmit)}>
+              {busy ? 'Creating…' : 'Create user'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function RoleOption({ selected, onClick, label, description }) {
+  return (
+    <button type="button" onClick={onClick} style={{
+      flex: 1, padding: '12px 14px', background: selected ? C.redSoft : C.white,
+      border: `2px solid ${selected ? C.red : C.line}`, borderRadius: 6,
+      cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit',
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: selected ? C.red : C.text }}>{label}</div>
+      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{description}</div>
+    </button>
+  );
+}
+
+// ============================================================
+// RESET PASSWORD MODAL
+// ============================================================
+function ResetPasswordModal({ session, target, onClose, onDone }) {
+  const [password, setPassword] = useState(generateMemorablePassword());
+  const [showPassword, setShowPassword] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [done, setDone] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setBusy(true);
+    try {
+      await callEdgeFunction('manage-users', {
+        action: 'reset_password',
+        user_id: target.user_id,
+        password,
+      }, session);
+      setDone(true);
+    } catch (err) {
+      setError(err.message);
+    } finally { setBusy(false); }
+  };
+
+  if (done) {
+    return (
+      <div className="arke-modal-backdrop" onClick={() => { onDone(`Password reset for ${target.email}.`); }}>
+        <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
+          <h2 style={{ ...brandTitle(), marginTop: 0, fontSize: 22 }}>✓ Password reset</h2>
+          <p style={{ color: C.muted, fontSize: 13, marginBottom: 16 }}>
+            Send the new password to <strong>{target.email}</strong>. The old one no longer works.
+          </p>
+          <Field label="New password (shown once)">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input readOnly value={password} onFocus={(e) => e.target.select()} style={{ ...inp(), fontFamily: 'monospace', fontSize: 16, letterSpacing: '0.05em' }} />
+              <CopyButton text={password} />
+            </div>
+          </Field>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 18 }}>
+            <button onClick={() => onDone(`Password reset for ${target.email}.`)} style={btn(false)}>Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
+        <h2 style={{ ...brandTitle(), marginTop: 0, fontSize: 22 }}>Reset password</h2>
+        <p style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
+          Reset the password for <strong>{target.email}</strong>. The current password will stop working immediately.
+        </p>
+        <form onSubmit={submit}>
+          <Field label="New password (≥ 8 characters)">
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={{ ...inp(), fontFamily: 'monospace' }}
+              />
+              <button type="button" onClick={() => setPassword(generateMemorablePassword())} style={btnGhost()} title="Regenerate">↻</button>
+              <button type="button" onClick={() => setShowPassword(s => !s)} style={btnGhost()}>
+                {showPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
+          </Field>
+          {error && (
+            <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+              {error}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button type="button" onClick={onClose} style={btnGhost()}>Cancel</button>
+            <button type="submit" disabled={busy || password.length < 8} style={btn(busy || password.length < 8)}>
+              {busy ? 'Resetting…' : 'Reset password'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// CONFIRM MODAL — reusable destructive-action confirmation
+// ============================================================
+function ConfirmModal({ title, message, confirmLabel, destructive, busy, onConfirm, onCancel }) {
+  return (
+    <div className="arke-modal-backdrop" onClick={busy ? null : onCancel}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <h2 style={{ ...brandTitle(), marginTop: 0, fontSize: 22 }}>{title}</h2>
+        <p style={{ color: C.text, fontSize: 14, lineHeight: 1.5, marginBottom: 24 }}>{message}</p>
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} disabled={busy} style={btnGhost()}>Cancel</button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              ...btn(busy),
+              background: destructive ? (busy ? C.line : C.redStatus) : (busy ? C.line : C.red),
+            }}
+          >
+            {busy ? 'Working…' : (confirmLabel || 'Confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// MEMORABLE PASSWORD GENERATOR
+// 4 word-like syllables + 2 digits — easy to dictate, hard to brute-force.
+// Used as default for invite + password reset (always editable).
+// ============================================================
+function generateMemorablePassword() {
+  const syllables = [
+    'kar','ven','tor','mes','lin','dor','pel','nav','quil','rax',
+    'fen','mil','tor','jex','vol','rip','mor','tan','sek','rud',
+    'lev','bin','cor','dax','fil','gor','han','jor','kix','lum',
+  ];
+  const pick = () => syllables[Math.floor(Math.random() * syllables.length)];
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const digits = String(10 + Math.floor(Math.random() * 90));
+  return cap(pick()) + pick() + '-' + pick() + cap(pick()) + digits;
+}
+
+// Small back-link primitive (used at the top of sub-pages)
+function BackLink({ href, children }) {
+  return (
+    <a href={href} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      color: C.muted, fontSize: 13, textDecoration: 'none', marginBottom: 12,
+    }}>
+      ← {children}
+    </a>
+  );
+}
+
+// Tiny secondary button style — used in dense rows like the user table
+function miniBtn() {
+  return {
+    padding: '5px 10px', background: 'transparent', color: C.text,
+    border: `1px solid ${C.line}`, borderRadius: 4, cursor: 'pointer',
+    fontSize: 11, fontWeight: 600, fontFamily: 'inherit',
+  };
+}
+
 function SettingsCategoriesStub()     { return <StubPage title="Settings — Categories" subtitle="Curate the overhead category list.">Category management — Stage 7.</StubPage>; }
 function SettingsCsvPresetsStub()     { return <StubPage title="Settings — CSV presets" subtitle="Saved column mappings for debtor uploads.">CSV preset management — Stage 6.</StubPage>; }
 
