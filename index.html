@@ -425,6 +425,15 @@ function App() {
 // ROUTE SWITCH
 // Routes a user can hit depend on their role. Any disallowed route → home.
 // ============================================================
+function Redirect({ navigate, to }) {
+  // Wrapper that performs a hash navigation on mount. Used by RouteSwitch
+  // to bounce users out of routes they can't access without breaking the
+  // rules of hooks (which would happen if we called useEffect conditionally
+  // inside RouteSwitch's branches).
+  useEffect(() => { navigate(to, {}, true); }, []);
+  return <LoadingMsg label="Redirecting…" />;
+}
+
 function RouteSwitch({ route, navigate, access }) {
   const isEditor = access.role === 'editor';
   const seg = route.path[0] || '';
@@ -434,19 +443,24 @@ function RouteSwitch({ route, navigate, access }) {
 
   // Wrong route for role → bounce home
   if (!isEditor && editorOnly.includes(seg)) {
-    useEffect(() => { navigate([], {}, true); }, []);
-    return <LoadingMsg label="Redirecting…" />;
+    return <Redirect navigate={navigate} to={[]} />;
   }
 
   // Home — different by role
   if (seg === '' || seg === 'home') {
-    return isEditor ? <CashflowPage access={access} /> : <ContributorHome access={access} navigate={navigate} />;
+    return isEditor ? <CashflowPage access={access} /> : <ProjectsRegisterPage access={access} navigate={navigate} />;
   }
   if (seg === 'cashflow') return <CashflowPage access={access} />;
   if (seg === 'projects') {
-    if (route.path[1] === 'new') return <NewProjectStub />;
+    // Wizard (both /new and /<id>/wizard) is editor-only
+    const isWizardRoute = route.path[1] === 'new' || route.path[2] === 'wizard';
+    if (!isEditor && isWizardRoute) {
+      return <Redirect navigate={navigate} to={['projects']} />;
+    }
+    if (route.path[1] === 'new') return <NewProjectWizard access={access} navigate={navigate} route={route} />;
+    if (route.path[1] && route.path[2] === 'wizard') return <NewProjectWizard access={access} navigate={navigate} route={route} projectId={route.path[1]} />;
     if (route.path[1]) return <ProjectDetailStub id={route.path[1]} access={access} />;
-    return <ProjectsListStub access={access} />;
+    return <ProjectsRegisterPage access={access} navigate={navigate} />;
   }
   if (seg === 'debtors') {
     if (route.path[1] === 'import') return <DebtorImportStub />;
@@ -678,13 +692,1146 @@ function StubPage({ title, subtitle, children }) {
 }
 
 function CashflowPage({ access })       { return <StubPage title="Master cashflow" subtitle="Weekly grid of money in and overheads out.">Cashflow grid — Stage 5.</StubPage>; }
-function ContributorHome({ access })    { return <StubPage title="My projects" subtitle="Projects you've been assigned to.">Contributor home — Stage 4.</StubPage>; }
-function ProjectsListStub({ access })   { return <StubPage title="Projects" subtitle={access.role === 'editor' ? 'All projects.' : 'Projects you have access to.'}>Project register — Stage 3.</StubPage>; }
-function NewProjectStub()               { return <StubPage title="New project" subtitle="Header → Payment type → Schedule → Done.">New project wizard — Stage 3.</StubPage>; }
 function ProjectDetailStub({ id })      { return <StubPage title="Project detail" subtitle={`Project ID: ${id}`}>Project detail — Stage 4.</StubPage>; }
 function DebtorListStub()               { return <StubPage title="Debtors" subtitle="Imported from CSV or added manually.">Debtor list — Stage 6.</StubPage>; }
 function DebtorImportStub()             { return <StubPage title="Import debtors" subtitle="Upload CSV, map columns, review, commit.">CSV import — Stage 6.</StubPage>; }
 function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
+
+// ============================================================
+// PROJECT REGISTER
+// Single-table list, filtered by RLS. Editors see all; contributors see only
+// assigned. Status shown as a coloured badge. Archived hidden by default.
+// ============================================================
+const PROJECT_STATUS_BADGE = {
+  draft:    { bg: C.amberLight,    fg: C.amber,    label: 'Draft' },
+  active:   { bg: C.greenLight,    fg: C.green,    label: 'Active' },
+  complete: { bg: C.prussianLight, fg: C.prussian, label: 'Complete' },
+  archived: { bg: C.line,          fg: C.muted,    label: 'Archived' },
+};
+
+function ProjectsRegisterPage({ access, navigate }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+  const [showArchived, setShowArchived] = useState(false);
+
+  const isEditor = access.role === 'editor';
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const list = await sbSelect('projects',
+          'select=id,name,number,value,status,payment_type,updated_at,created_by_email,owner_email&order=updated_at.desc',
+          access.session);
+        setRows(list);
+      } catch (e) { setError(e.message); }
+    })();
+  }, [access.session]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (rows === null) return <LoadingMsg label="Loading projects…" />;
+
+  const visible = showArchived ? rows : rows.filter(r => r.status !== 'archived');
+  const archivedCount = rows.filter(r => r.status === 'archived').length;
+
+  return (
+    <div style={{ maxWidth: 1100 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h1 style={brandTitle()}>{isEditor ? 'Projects' : 'My projects'}</h1>
+          <p style={{ color: C.muted, fontSize: 14, margin: 0 }}>
+            {isEditor
+              ? 'All projects in the register.'
+              : 'Projects you’ve been assigned to.'}
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <ToggleSwitch
+            checked={showArchived}
+            onChange={setShowArchived}
+            label={`Show archived${archivedCount > 0 ? ` (${archivedCount})` : ''}`}
+          />
+          {isEditor && (
+            <a href={buildHash(['projects','new'])} style={{ ...btn(false), textDecoration: 'none', display: 'inline-flex', alignItems: 'center' }}>
+              + New project
+            </a>
+          )}
+        </div>
+      </div>
+
+      {visible.length === 0 ? (
+        <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, padding: 40, textAlign: 'center', color: C.muted }}>
+          <div style={{ fontSize: 14, marginBottom: 16 }}>
+            {rows.length === 0
+              ? (isEditor ? 'No projects yet.' : 'You haven’t been assigned to any projects yet.')
+              : 'No matching projects.'}
+          </div>
+          {isEditor && rows.length === 0 && (
+            <a href={buildHash(['projects','new'])} style={{ ...btn(false), textDecoration: 'none', display: 'inline-block' }}>
+              + Create your first project
+            </a>
+          )}
+        </div>
+      ) : (
+        <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '2.2fr 1fr 1.1fr 0.8fr 1.1fr 0.7fr',
+            gap: 12, padding: '12px 18px', background: C.redSoft,
+            borderBottom: `1px solid ${C.line}`,
+            fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>Project</div>
+            <div>Number</div>
+            <div style={{ textAlign: 'right' }}>Value</div>
+            <div>Type</div>
+            <div>Status</div>
+            <div style={{ textAlign: 'right' }}>Updated</div>
+          </div>
+          {visible.map(r => <ProjectRegisterRow key={r.id} row={r} isEditor={isEditor} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProjectRegisterRow({ row, isEditor }) {
+  const badge = PROJECT_STATUS_BADGE[row.status] || PROJECT_STATUS_BADGE.draft;
+  const isDraft = row.status === 'draft';
+  // Drafts route editors to the wizard so they can resume where they left off.
+  // For contributors (who shouldn't see drafts in practice, but might if assigned
+  // to one), route to the regular detail page.
+  const href = (isDraft && isEditor)
+    ? buildHash(['projects', row.id, 'wizard'], { step: '1' })
+    : buildHash(['projects', row.id]);
+  const typeLabel = !row.payment_type ? '—' : (row.payment_type === 'stage' ? 'Stage payment' : 'Valuation');
+
+  return (
+    <a href={href} style={{
+      display: 'grid', gridTemplateColumns: '2.2fr 1fr 1.1fr 0.8fr 1.1fr 0.7fr',
+      gap: 12, padding: '14px 18px', borderBottom: `1px solid ${C.line}`,
+      textDecoration: 'none', color: C.text, alignItems: 'center',
+      transition: 'background 0.1s',
+    }}
+      onMouseEnter={(e) => e.currentTarget.style.background = C.redSoft}
+      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+    >
+      <div style={{ fontSize: 14, fontWeight: 600 }}>{row.name || '(no name)'}</div>
+      <div style={{ fontSize: 13, color: C.muted, fontFamily: 'monospace' }}>{row.number || '—'}</div>
+      <div style={{ fontSize: 13, fontVariantNumeric: 'tabular-nums', textAlign: 'right' }}>
+        {row.value ? `£${fmtMoney(row.value)}` : '—'}
+      </div>
+      <div style={{ fontSize: 12, color: C.muted }}>{typeLabel}</div>
+      <div>
+        <span style={{
+          background: badge.bg, color: badge.fg, padding: '3px 10px', borderRadius: 10,
+          fontSize: 11, fontWeight: 600,
+        }}>
+          ● {badge.label}
+        </span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, textAlign: 'right' }}>{timeAgo(row.updated_at)}</div>
+    </a>
+  );
+}
+
+// ============================================================
+// TOGGLE SWITCH PRIMITIVE
+// ============================================================
+function ToggleSwitch({ checked, onChange, label }) {
+  return (
+    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: C.muted, userSelect: 'none' }}>
+      <input
+        type="checkbox"
+        checked={!!checked}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }}
+      />
+      <span style={{
+        position: 'relative', width: 32, height: 18,
+        background: checked ? C.red : C.line, borderRadius: 9,
+        transition: 'background 0.15s',
+      }}>
+        <span style={{
+          position: 'absolute', top: 2, left: checked ? 16 : 2,
+          width: 14, height: 14, background: C.white, borderRadius: 7,
+          transition: 'left 0.15s',
+        }} />
+      </span>
+      <span>{label}</span>
+    </label>
+  );
+}
+
+// ============================================================
+// NEW PROJECT WIZARD
+// Routes:
+//   #/projects/new?step=N        — fresh wizard, creates a draft on step 1 save
+//   #/projects/<id>/wizard?step=N — resume an existing draft
+// Step 1: Header  | Step 2: Payment type  | Step 3: Schedule  | Step 4: Done
+// ============================================================
+function NewProjectWizard({ access, navigate, route, projectId }) {
+  const stepParam = parseInt(route.params.step || '1', 10);
+  const step = (stepParam >= 1 && stepParam <= 4) ? stepParam : 1;
+
+  const [loading, setLoading] = useState(!!projectId);
+  const [project, setProject] = useState(null); // the row in projects
+  const [error, setError] = useState(null);
+
+  // Load existing project (for resume)
+  useEffect(() => {
+    if (!projectId) { setLoading(false); return; }
+    (async () => {
+      setLoading(true);
+      try {
+        const rows = await sbSelect('projects', `id=eq.${projectId}&limit=1`, access.session);
+        if (!rows || rows.length === 0) {
+          setError('Project not found.');
+          setLoading(false);
+          return;
+        }
+        setProject(rows[0]);
+      } catch (e) { setError(e.message); }
+      finally { setLoading(false); }
+    })();
+  }, [projectId, access.session]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (loading) return <LoadingMsg label="Loading…" />;
+
+  const goStep = (n) => {
+    const id = projectId || (project && project.id);
+    if (id) {
+      navigate(['projects', id, 'wizard'], { step: String(n) });
+    } else {
+      navigate(['projects', 'new'], { step: String(n) });
+    }
+  };
+
+  const finish = () => {
+    if (project) navigate(['projects', project.id]);
+    else navigate(['projects']);
+  };
+
+  return (
+    <div style={{ maxWidth: 760 }}>
+      <BackLink href={buildHash(['projects'])}>Projects</BackLink>
+      <h1 style={brandTitle()}>{project ? `Edit “${project.name || 'Untitled'}”` : 'New project'}</h1>
+      <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 20 }}>
+        Step {step} of 4 — {['Header','Payment type','Schedule','Done'][step - 1]}
+      </p>
+
+      <WizardStepper step={step} project={project} />
+
+      <div style={{ marginTop: 20 }}>
+        {step === 1 && (
+          <WizardStep1Header
+            access={access} project={project} setProject={setProject}
+            onNext={() => goStep(2)}
+          />
+        )}
+        {step === 2 && project && (
+          <WizardStep2Type
+            access={access} project={project} setProject={setProject}
+            onBack={() => goStep(1)} onNext={() => goStep(3)}
+          />
+        )}
+        {step === 3 && project && (
+          <WizardStep3Schedule
+            access={access} project={project} setProject={setProject}
+            onBack={() => goStep(2)} onNext={() => goStep(4)}
+          />
+        )}
+        {step === 4 && project && (
+          <WizardStep4Done
+            access={access} project={project} setProject={setProject}
+            onBack={() => goStep(3)} onFinish={finish}
+          />
+        )}
+        {step >= 2 && !project && (
+          <Card>
+            <p style={{ color: C.muted, fontSize: 13, margin: 0 }}>Complete step 1 first.</p>
+            <div style={{ marginTop: 12 }}>
+              <button onClick={() => goStep(1)} style={btnGhost()}>← Back to step 1</button>
+            </div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WizardStepper({ step, project }) {
+  const labels = ['Header', 'Payment type', 'Schedule', 'Done'];
+  // A step is reachable if its preceding step has produced enough data:
+  //   step 1: always reachable
+  //   step 2+: requires project to exist
+  const reachable = (n) => n === 1 || !!project;
+  return (
+    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+      {labels.map((label, i) => {
+        const n = i + 1;
+        const isCurrent = n === step;
+        const done = n < step;
+        const can = reachable(n);
+        return (
+          <React.Fragment key={n}>
+            <div style={{
+              flex: 1, padding: '8px 12px', textAlign: 'center',
+              border: `1px solid ${isCurrent ? C.red : C.line}`,
+              background: isCurrent ? C.redSoft : (done ? C.greenLight : C.white),
+              color: isCurrent ? C.red : (done ? C.green : (can ? C.text : C.muted)),
+              borderRadius: 6, fontSize: 12, fontWeight: 600,
+              opacity: can ? 1 : 0.5,
+            }}>
+              {done && '✓ '}{n}. {label}
+            </div>
+            {i < labels.length - 1 && <div style={{ width: 8 }} />}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+// ============================================================
+// WIZARD STEP 1 — HEADER
+// ============================================================
+function WizardStep1Header({ access, project, setProject, onNext }) {
+  const [form, setForm] = useState(() => ({
+    name:              project ? (project.name || '') : '',
+    number:            project ? (project.number || '') : '',
+    value:             project ? project.value : '',
+    retention_pct:     project ? project.retention_pct : '',
+    start_date:        project ? (project.start_date || '') : '',
+    end_date:          project ? (project.end_date || '') : '',
+    retention_date:    project ? (project.retention_date || '') : '',
+    payment_terms_days: project ? project.payment_terms_days : 30,
+    owner_email:       project ? (project.owner_email || '') : '',
+  }));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const valid = form.name && form.name.trim().length > 0 && Number(form.value) >= 0;
+
+  const update = (field, val) => setForm(prev => ({ ...prev, [field]: val }));
+
+  const save = async () => {
+    if (!valid) return;
+    setBusy(true); setError('');
+    try {
+      const payload = {
+        name: form.name.trim(),
+        number: form.number.trim() || null,
+        value: Number(form.value) || 0,
+        retention_pct: form.retention_pct === '' ? 0 : Number(form.retention_pct),
+        start_date: form.start_date || null,
+        end_date: form.end_date || null,
+        retention_date: form.retention_date || null,
+        payment_terms_days: Number(form.payment_terms_days) || 30,
+        owner_email: form.owner_email.trim() || null,
+      };
+      let updated;
+      if (project) {
+        updated = await sbUpdate('projects', `id=eq.${project.id}`, payload, access.session);
+      } else {
+        // Add the create_event to audit_log on insert
+        const auditEvent = { event: 'created', actor: getEmail(access.session), at: new Date().toISOString() };
+        updated = await sbInsert('projects', {
+          ...payload,
+          status: 'draft',
+          created_by_email: getEmail(access.session),
+          audit_log: [auditEvent],
+        }, access.session);
+      }
+      setProject(updated[0]);
+      onNext();
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <h2 style={{ marginTop: 0, fontSize: 18, color: C.text }}>Project header</h2>
+      <p style={{ color: C.muted, fontSize: 13, marginTop: 4, marginBottom: 20 }}>
+        The headline information about this project. Required: name and value.
+      </p>
+
+      <Field label="Project name *">
+        <input value={form.name} onChange={(e) => update('name', e.target.value)} style={inp()} autoFocus />
+      </Field>
+
+      <div style={twoCol()}>
+        <Field label="Project number">
+          <input value={form.number} onChange={(e) => update('number', e.target.value)} style={inp()} placeholder="e.g. P-2401" />
+        </Field>
+        <Field label="Owner">
+          <input value={form.owner_email} onChange={(e) => update('owner_email', e.target.value)} style={inp()} placeholder="who@arkecreative.co.uk" />
+        </Field>
+      </div>
+
+      <div style={twoCol()}>
+        <Field label="Project value (£)">
+          <MoneyInput value={form.value} onChange={(v) => update('value', v)} />
+        </Field>
+        <Field label="Retention (%)">
+          <NumberInput value={form.retention_pct} onChange={(v) => update('retention_pct', v)} step="0.01" placeholder="e.g. 5" />
+        </Field>
+      </div>
+
+      <div style={threeCol()}>
+        <Field label="Start date">
+          <DateInput value={form.start_date} onChange={(v) => update('start_date', v)} />
+        </Field>
+        <Field label="End date">
+          <DateInput value={form.end_date} onChange={(v) => update('end_date', v)} />
+        </Field>
+        <Field label="Retention release date">
+          <DateInput value={form.retention_date} onChange={(v) => update('retention_date', v)} />
+        </Field>
+      </div>
+
+      <Field label="Payment terms (days)">
+        <NumberInput value={form.payment_terms_days} onChange={(v) => update('payment_terms_days', v)} step="1" placeholder="30" />
+      </Field>
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
+        <button onClick={save} disabled={!valid || busy} style={btn(!valid || busy)}>
+          {busy ? 'Saving…' : (project ? 'Save & continue →' : 'Create & continue →')}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+// ============================================================
+// WIZARD STEP 2 — PAYMENT TYPE
+// ============================================================
+function WizardStep2Type({ access, project, setProject, onBack, onNext }) {
+  const [paymentType, setPaymentType] = useState(project.payment_type || null);
+  const [first_valuation_date, setFirstValDate] = useState(project.first_valuation_date || '');
+  const [valuation_cycle_days, setCycleDays] = useState(project.valuation_cycle_days || 30);
+  const [review_period_days, setReviewDays] = useState(project.review_period_days || 14);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  // For valuation, all three valuation fields must be set.
+  // For stage, just the type is needed at this step.
+  const valid = paymentType === 'stage' || (
+    paymentType === 'valuation'
+    && first_valuation_date
+    && Number(valuation_cycle_days) > 0
+    && Number(review_period_days) >= 0
+  );
+
+  const save = async () => {
+    if (!valid) return;
+    setBusy(true); setError('');
+    try {
+      const payload = {
+        payment_type: paymentType,
+        first_valuation_date: paymentType === 'valuation' ? (first_valuation_date || null) : null,
+        valuation_cycle_days: paymentType === 'valuation' ? (Number(valuation_cycle_days) || null) : null,
+        review_period_days: paymentType === 'valuation' ? (Number(review_period_days) || null) : null,
+      };
+      const updated = await sbUpdate('projects', `id=eq.${project.id}`, payload, access.session);
+      setProject(updated[0]);
+      onNext();
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <h2 style={{ marginTop: 0, fontSize: 18, color: C.text }}>Payment type</h2>
+      <p style={{ color: C.muted, fontSize: 13, marginTop: 4, marginBottom: 20 }}>
+        How is this project billed? Pick one to reveal the relevant fields.
+      </p>
+
+      <div style={{ display: 'flex', gap: 12, marginBottom: 20 }}>
+        <PaymentTypeOption
+          selected={paymentType === 'stage'}
+          onClick={() => setPaymentType('stage')}
+          label="Stage payment"
+          description="Fixed schedule of invoices at agreed percentages or amounts of the project value."
+        />
+        <PaymentTypeOption
+          selected={paymentType === 'valuation'}
+          onClick={() => setPaymentType('valuation')}
+          label="Valuation"
+          description="Recurring claims raised at intervals, reviewed, then invoiced."
+        />
+      </div>
+
+      {paymentType === 'valuation' && (
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 16, marginTop: 4 }}>
+          <h3 style={{ fontSize: 14, color: C.text, margin: '0 0 12px' }}>Valuation parameters</h3>
+          <div style={threeCol()}>
+            <Field label="First valuation date">
+              <DateInput value={first_valuation_date} onChange={setFirstValDate} />
+            </Field>
+            <Field label="Cycle (days)">
+              <NumberInput value={valuation_cycle_days} onChange={setCycleDays} step="1" placeholder="30" />
+            </Field>
+            <Field label="Review period (days)">
+              <NumberInput value={review_period_days} onChange={setReviewDays} step="1" placeholder="14" />
+            </Field>
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+            Cycle = how often a new claim is raised. Review = how long between claim and invoice.
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 20 }}>
+        <button onClick={onBack} style={btnGhost()}>← Back</button>
+        <button onClick={save} disabled={!valid || busy} style={btn(!valid || busy)}>
+          {busy ? 'Saving…' : 'Save & continue →'}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function PaymentTypeOption({ selected, onClick, label, description }) {
+  return (
+    <button type="button" onClick={onClick} style={{
+      flex: 1, padding: '16px 18px', background: selected ? C.redSoft : C.white,
+      border: `2px solid ${selected ? C.red : C.line}`, borderRadius: 8,
+      cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit',
+    }}>
+      <div style={{ fontSize: 14, fontWeight: 700, color: selected ? C.red : C.text, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5 }}>{description}</div>
+    </button>
+  );
+}
+
+// ============================================================
+// WIZARD STEP 3 — SCHEDULE
+// Branches by project.payment_type into Stage or Valuation editor.
+// ============================================================
+function WizardStep3Schedule({ access, project, setProject, onBack, onNext }) {
+  return project.payment_type === 'stage'
+    ? <StageScheduleEditor access={access} project={project} setProject={setProject} onBack={onBack} onNext={onNext} />
+    : <ValuationScheduleEditor access={access} project={project} setProject={setProject} onBack={onBack} onNext={onNext} />;
+}
+
+// ============================================================
+// STAGE PAYMENT SCHEDULE EDITOR
+// Stores invoice_pct in DB. UI offers % and £ modes; conversion is one-way at display.
+// Hard-validated: sum of % must equal 100 (tolerance 0.005%).
+// ============================================================
+function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
+  const [rows, setRows] = useState(null);
+  const [mode, setMode] = useState('pct'); // 'pct' | 'gbp'
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [askSplit, setAskSplit] = useState(false);
+
+  // Load existing invoice rows (in case the user is resuming a draft)
+  useEffect(() => {
+    (async () => {
+      try {
+        const list = await sbSelect('project_invoices',
+          `project_id=eq.${project.id}&order=sequence.asc`,
+          access.session);
+        setRows(list.map((r, i) => ({
+          // Each row gets a temp ID for keyed React rendering. Sticky across edits.
+          _key: r.id || `existing-${i}-${Math.random()}`,
+          id: r.id, // real DB id (if persisted)
+          sequence: r.sequence,
+          invoice_date: r.invoice_date || '',
+          payment_date_override: r.payment_date_override || '',
+          invoice_pct: r.invoice_pct == null ? '' : r.invoice_pct,
+          notes: r.notes || '',
+        })));
+      } catch (e) { setError(e.message); }
+    })();
+  }, [project.id, access.session]);
+
+  if (rows === null) return <LoadingMsg label="Loading schedule…" />;
+
+  const projectValue = Number(project.value) || 0;
+
+  // pct/gbp conversion helpers
+  const pctToGbp = (pct) => pct == null || pct === '' ? '' : Number(pct) / 100 * projectValue;
+  const gbpToPct = (gbp) => gbp == null || gbp === '' || projectValue === 0 ? '' : Number(gbp) / projectValue * 100;
+
+  const sumPct = rows.reduce((s, r) => s + (Number(r.invoice_pct) || 0), 0);
+  const sumGbp = sumPct / 100 * projectValue;
+  const validSum = Math.abs(sumPct - 100) <= 0.005;
+
+  const addRow = () => {
+    setRows(prev => [...prev, {
+      _key: `new-${Date.now()}-${Math.random()}`,
+      id: null,
+      sequence: prev.length + 1,
+      invoice_date: '',
+      payment_date_override: '',
+      invoice_pct: '',
+      notes: '',
+    }]);
+  };
+
+  const removeRow = (key) => {
+    setRows(prev => prev.filter(r => r._key !== key).map((r, i) => ({ ...r, sequence: i + 1 })));
+  };
+
+  const updateRow = (key, field, value) => {
+    setRows(prev => prev.map(r => {
+      if (r._key !== key) return r;
+      if (field === 'invoice_pct' && mode === 'gbp') {
+        // In £ mode, "invoice_pct" is actually a £ input; convert and store as %.
+        return { ...r, invoice_pct: value === '' ? '' : Number(gbpToPct(value)) };
+      }
+      return { ...r, [field]: value };
+    }));
+  };
+
+  const splitEvenly = (n) => {
+    const evenPct = Math.round((100 / n) * 10000) / 10000; // 4 dp
+    // Account for rounding remainder on the last row so the sum is exactly 100.
+    const lastPct = Math.round((100 - evenPct * (n - 1)) * 10000) / 10000;
+    // Spread dates evenly between start_date and end_date, or use today's date.
+    const newRows = [];
+    const start = project.start_date ? new Date(project.start_date) : new Date();
+    const end = project.end_date ? new Date(project.end_date) : new Date(start.getTime() + n * 30 * 86400 * 1000);
+    const totalMs = end.getTime() - start.getTime();
+    for (let i = 0; i < n; i++) {
+      const date = new Date(start.getTime() + (totalMs * i) / Math.max(n - 1, 1));
+      newRows.push({
+        _key: `split-${Date.now()}-${i}-${Math.random()}`,
+        id: null,
+        sequence: i + 1,
+        invoice_date: date.toISOString().slice(0, 10),
+        payment_date_override: '',
+        invoice_pct: i === n - 1 ? lastPct : evenPct,
+        notes: '',
+      });
+    }
+    setRows(newRows);
+    setAskSplit(false);
+  };
+
+  const save = async () => {
+    if (!validSum) { setError('Stages must sum to exactly 100%.'); return; }
+    if (rows.length === 0) { setError('Add at least one stage.'); return; }
+    if (rows.some(r => !r.invoice_date)) { setError('Every stage needs an invoice date.'); return; }
+    setBusy(true); setError('');
+    try {
+      // Wipe and rewrite — simplest reliable approach for a wizard.
+      // RLS allows pi_write because the project exists and current user can access it.
+      await sbDelete('project_invoices', `project_id=eq.${project.id}`, access.session);
+      const inserts = rows.map(r => ({
+        project_id: project.id,
+        sequence: r.sequence,
+        invoice_date: r.invoice_date,
+        payment_date_override: r.payment_date_override || null,
+        invoice_pct: Number(r.invoice_pct),
+        invoice_value_net: pctToGbp(r.invoice_pct), // denormalised for convenience
+        notes: r.notes || null,
+      }));
+      if (inserts.length > 0) await sbInsert('project_invoices', inserts, access.session);
+      onNext();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+        <h2 style={{ marginTop: 0, fontSize: 18, color: C.text }}>Stage payment schedule</h2>
+        <ModeToggle mode={mode} setMode={setMode} />
+      </div>
+      <p style={{ color: C.muted, fontSize: 13, marginTop: 0, marginBottom: 20 }}>
+        Add one row per invoice. {mode === 'pct'
+          ? 'The percentages must sum to exactly 100%.'
+          : `The pound amounts must sum to exactly £${fmtMoney(projectValue)}.`}
+      </p>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        <button onClick={addRow} style={btnGhost()}>+ Add stage</button>
+        <button onClick={() => setAskSplit(true)} style={btnGhost()}>Split evenly into N stages…</button>
+        {askSplit && <SplitPrompt onCancel={() => setAskSplit(false)} onSplit={splitEvenly} />}
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ padding: 30, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
+          No stages yet. Add one above or use “Split evenly”.
+        </div>
+      ) : (
+        <div>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
+            gap: 8, padding: '6px 4px',
+            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>#</div>
+            <div>Invoice date</div>
+            <div>Payment date</div>
+            <div style={{ textAlign: 'right' }}>{mode === 'pct' ? '% of value' : '£ net'}</div>
+            <div>Notes</div>
+            <div></div>
+          </div>
+          {rows.map((r, i) => (
+            <StageRowEditor
+              key={r._key}
+              row={r}
+              mode={mode}
+              projectValue={projectValue}
+              onChange={(field, value) => updateRow(r._key, field, value)}
+              onRemove={() => removeRow(r._key)}
+            />
+          ))}
+
+          {/* Sum indicator */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
+            gap: 8, padding: '10px 4px 4px',
+            borderTop: `1px solid ${C.line}`, marginTop: 8,
+            alignItems: 'center',
+          }}>
+            <div></div>
+            <div></div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, textAlign: 'right' }}>Sum</div>
+            <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums',
+              color: validSum ? C.green : C.redStatus }}>
+              {mode === 'pct' ? `${sumPct.toFixed(4).replace(/\.?0+$/,'')}%` : `£${fmtMoney(sumGbp)}`}
+            </div>
+            <div style={{ fontSize: 12, color: validSum ? C.green : C.redStatus, fontWeight: 600 }}>
+              {validSum
+                ? '✓ Matches'
+                : (mode === 'pct'
+                  ? `Need 100% — ${(100 - sumPct).toFixed(4).replace(/\.?0+$/,'')}% to go`
+                  : `Need £${fmtMoney(projectValue)} — £${fmtMoney(projectValue - sumGbp)} to go`)}
+            </div>
+            <div></div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 20 }}>
+        <button onClick={onBack} style={btnGhost()}>← Back</button>
+        <button onClick={save} disabled={!validSum || busy || rows.length === 0} style={btn(!validSum || busy || rows.length === 0)}>
+          {busy ? 'Saving…' : 'Save & continue →'}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function StageRowEditor({ row, mode, projectValue, onChange, onRemove }) {
+  const valueShown = mode === 'pct'
+    ? row.invoice_pct
+    : (row.invoice_pct === '' ? '' : (Number(row.invoice_pct) / 100 * projectValue));
+
+  return (
+    <div style={{
+      display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
+      gap: 8, padding: '6px 4px', alignItems: 'center',
+    }}>
+      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{row.sequence}</div>
+      <DateInput value={row.invoice_date} onChange={(v) => onChange('invoice_date', v)} />
+      <DateInput value={row.payment_date_override} onChange={(v) => onChange('payment_date_override', v)} placeholder="(auto)" />
+      <NumberInput
+        value={valueShown}
+        onChange={(v) => onChange('invoice_pct', v)}
+        step={mode === 'pct' ? '0.01' : '1'}
+        align="right"
+      />
+      <input value={row.notes} onChange={(e) => onChange('notes', e.target.value)} style={inp()} placeholder="Optional" />
+      <button onClick={onRemove} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
+    </div>
+  );
+}
+
+function ModeToggle({ mode, setMode }) {
+  return (
+    <div style={{ display: 'inline-flex', border: `1px solid ${C.line}`, borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>
+      <button onClick={() => setMode('pct')} style={modeBtn(mode === 'pct')}>%</button>
+      <button onClick={() => setMode('gbp')} style={modeBtn(mode === 'gbp')}>£</button>
+    </div>
+  );
+}
+
+function modeBtn(active) {
+  return {
+    padding: '6px 14px',
+    background: active ? C.red : C.white,
+    color: active ? C.white : C.text,
+    border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 600, fontSize: 13,
+  };
+}
+
+function SplitPrompt({ onCancel, onSplit }) {
+  const [n, setN] = useState(4);
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: C.bg, border: `1px solid ${C.line}`, borderRadius: 6 }}>
+      <span style={{ fontSize: 12, color: C.muted }}>How many stages?</span>
+      <input
+        type="number" value={n} min="1" max="50"
+        onChange={(e) => setN(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+        style={{ ...inp(), width: 60, padding: '4px 6px', fontSize: 13 }}
+        autoFocus
+      />
+      <button onClick={() => onSplit(n)} style={{ ...btn(false), padding: '4px 10px', fontSize: 12 }}>Split</button>
+      <button onClick={onCancel} style={{ ...btnGhost(), padding: '4px 10px', fontSize: 12 }}>Cancel</button>
+    </div>
+  );
+}
+
+// ============================================================
+// VALUATION SCHEDULE EDITOR
+// Stores invoice_value_net directly in DB. Claim count derived from row count.
+// Brief specifies no enforced sum, but we show sum vs project value for sanity.
+// ============================================================
+function ValuationScheduleEditor({ access, project, setProject, onBack, onNext }) {
+  const [rows, setRows] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [askGen, setAskGen] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const list = await sbSelect('project_invoices',
+          `project_id=eq.${project.id}&order=sequence.asc`,
+          access.session);
+        setRows(list.map((r, i) => ({
+          _key: r.id || `existing-${i}-${Math.random()}`,
+          id: r.id,
+          sequence: r.sequence,
+          invoice_date: r.invoice_date || '',
+          payment_date_override: r.payment_date_override || '',
+          invoice_value_net: r.invoice_value_net == null ? '' : r.invoice_value_net,
+          notes: r.notes || '',
+        })));
+      } catch (e) { setError(e.message); }
+    })();
+  }, [project.id, access.session]);
+
+  if (rows === null) return <LoadingMsg label="Loading schedule…" />;
+
+  const projectValue = Number(project.value) || 0;
+  const sumGbp = rows.reduce((s, r) => s + (Number(r.invoice_value_net) || 0), 0);
+
+  const addRow = () => {
+    setRows(prev => [...prev, {
+      _key: `new-${Date.now()}-${Math.random()}`,
+      id: null,
+      sequence: prev.length + 1,
+      invoice_date: '',
+      payment_date_override: '',
+      invoice_value_net: '',
+      notes: '',
+    }]);
+  };
+
+  const removeRow = (key) => {
+    setRows(prev => prev.filter(r => r._key !== key).map((r, i) => ({ ...r, sequence: i + 1 })));
+  };
+
+  const updateRow = (key, field, value) => {
+    setRows(prev => prev.map(r => r._key === key ? { ...r, [field]: value } : r));
+  };
+
+  const generate = (n, amount) => {
+    // Walk forward from First Valuation Date in valuation_cycle_days steps.
+    const start = project.first_valuation_date ? new Date(project.first_valuation_date) : new Date();
+    const cycle = Number(project.valuation_cycle_days) || 30;
+    const newRows = [];
+    for (let i = 0; i < n; i++) {
+      const valuationDate = new Date(start.getTime() + i * cycle * 86400 * 1000);
+      // Invoice date = valuation date + review period
+      const review = Number(project.review_period_days) || 0;
+      const invoiceDate = new Date(valuationDate.getTime() + review * 86400 * 1000);
+      newRows.push({
+        _key: `gen-${Date.now()}-${i}-${Math.random()}`,
+        id: null,
+        sequence: i + 1,
+        invoice_date: invoiceDate.toISOString().slice(0, 10),
+        payment_date_override: '',
+        invoice_value_net: amount,
+        notes: `Claim ${i + 1}`,
+      });
+    }
+    setRows(newRows);
+    setAskGen(false);
+  };
+
+  const save = async () => {
+    if (rows.length === 0) { setError('Add at least one claim.'); return; }
+    if (rows.some(r => !r.invoice_date)) { setError('Every claim needs an invoice date.'); return; }
+    if (rows.some(r => r.invoice_value_net === '' || Number(r.invoice_value_net) <= 0)) {
+      setError('Every claim needs a positive value.'); return;
+    }
+    setBusy(true); setError('');
+    try {
+      await sbDelete('project_invoices', `project_id=eq.${project.id}`, access.session);
+      const inserts = rows.map(r => ({
+        project_id: project.id,
+        sequence: r.sequence,
+        invoice_date: r.invoice_date,
+        payment_date_override: r.payment_date_override || null,
+        invoice_pct: null,
+        invoice_value_net: Number(r.invoice_value_net),
+        notes: r.notes || null,
+      }));
+      if (inserts.length > 0) await sbInsert('project_invoices', inserts, access.session);
+      onNext();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <h2 style={{ marginTop: 0, fontSize: 18, color: C.text }}>Valuation claims</h2>
+      <p style={{ color: C.muted, fontSize: 13, marginTop: 4, marginBottom: 20 }}>
+        Estimated claims for this project. Sum is informational — valuations are estimates, not contracts.
+      </p>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button onClick={addRow} style={btnGhost()}>+ Add claim</button>
+        <button onClick={() => setAskGen(true)} style={btnGhost()}>Generate N claims at £X each…</button>
+        {askGen && <ValGenPrompt project={project} onCancel={() => setAskGen(false)} onGenerate={generate} />}
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ padding: 30, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
+          No claims yet. Add one above or generate a schedule.
+        </div>
+      ) : (
+        <div>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
+            gap: 8, padding: '6px 4px',
+            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>#</div>
+            <div>Invoice date</div>
+            <div>Payment date</div>
+            <div style={{ textAlign: 'right' }}>£ net</div>
+            <div>Notes</div>
+            <div></div>
+          </div>
+          {rows.map(r => (
+            <ValuationRowEditor
+              key={r._key} row={r}
+              onChange={(field, value) => updateRow(r._key, field, value)}
+              onRemove={() => removeRow(r._key)}
+            />
+          ))}
+          <div style={{
+            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
+            gap: 8, padding: '10px 4px 4px',
+            borderTop: `1px solid ${C.line}`, marginTop: 8, alignItems: 'center',
+          }}>
+            <div></div>
+            <div></div>
+            <div style={{ fontSize: 12, fontWeight: 700, textAlign: 'right' }}>Sum</div>
+            <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums' }}>
+              £{fmtMoney(sumGbp)}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted }}>
+              of £{fmtMoney(projectValue)} project value
+              {projectValue > 0 && (
+                <span style={{ marginLeft: 6 }}>({(sumGbp / projectValue * 100).toFixed(1)}%)</span>
+              )}
+            </div>
+            <div></div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 20 }}>
+        <button onClick={onBack} style={btnGhost()}>← Back</button>
+        <button onClick={save} disabled={busy || rows.length === 0} style={btn(busy || rows.length === 0)}>
+          {busy ? 'Saving…' : 'Save & continue →'}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function ValuationRowEditor({ row, onChange, onRemove }) {
+  return (
+    <div style={{
+      display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
+      gap: 8, padding: '6px 4px', alignItems: 'center',
+    }}>
+      <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{row.sequence}</div>
+      <DateInput value={row.invoice_date} onChange={(v) => onChange('invoice_date', v)} />
+      <DateInput value={row.payment_date_override} onChange={(v) => onChange('payment_date_override', v)} placeholder="(auto)" />
+      <NumberInput value={row.invoice_value_net} onChange={(v) => onChange('invoice_value_net', v)} step="0.01" align="right" />
+      <input value={row.notes} onChange={(e) => onChange('notes', e.target.value)} style={inp()} placeholder="Optional" />
+      <button onClick={onRemove} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
+    </div>
+  );
+}
+
+function ValGenPrompt({ project, onCancel, onGenerate }) {
+  const [n, setN] = useState(6);
+  const projectValue = Number(project.value) || 0;
+  const [amount, setAmount] = useState(projectValue > 0 ? Math.round(projectValue / n) : 0);
+  // Re-default amount whenever n changes (only on user-typed n changes really; cheap to allow)
+  const handleN = (nv) => {
+    const newN = Math.max(1, Math.min(60, Number(nv) || 1));
+    setN(newN);
+    if (projectValue > 0) setAmount(Math.round(projectValue / newN));
+  };
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: C.bg, border: `1px solid ${C.line}`, borderRadius: 6, flexWrap: 'wrap' }}>
+      <span style={{ fontSize: 12, color: C.muted }}>How many?</span>
+      <input type="number" value={n} min="1" max="60" onChange={(e) => handleN(e.target.value)} style={{ ...inp(), width: 60, padding: '4px 6px', fontSize: 13 }} autoFocus />
+      <span style={{ fontSize: 12, color: C.muted }}>at £</span>
+      <input type="number" value={amount} step="0.01" onChange={(e) => setAmount(Number(e.target.value) || 0)} style={{ ...inp(), width: 100, padding: '4px 6px', fontSize: 13, textAlign: 'right' }} />
+      <span style={{ fontSize: 12, color: C.muted }}>each</span>
+      <button onClick={() => onGenerate(n, amount)} style={{ ...btn(false), padding: '4px 10px', fontSize: 12 }}>Generate</button>
+      <button onClick={onCancel} style={{ ...btnGhost(), padding: '4px 10px', fontSize: 12 }}>Cancel</button>
+    </div>
+  );
+}
+
+// ============================================================
+// WIZARD STEP 4 — DONE
+// Confirm and flip status from draft -> active.
+// ============================================================
+function WizardStep4Done({ access, project, setProject, onBack, onFinish }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const activate = async () => {
+    setBusy(true); setError('');
+    try {
+      const auditEvent = { event: 'activated', actor: getEmail(access.session), at: new Date().toISOString() };
+      const updated = await sbUpdate('projects', `id=eq.${project.id}`, {
+        status: 'active',
+        audit_log: [...(Array.isArray(project.audit_log) ? project.audit_log : []), auditEvent],
+      }, access.session);
+      setProject(updated[0]);
+      onFinish();
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <h2 style={{ marginTop: 0, fontSize: 18, color: C.text }}>Ready to activate</h2>
+      <p style={{ color: C.muted, fontSize: 13, marginTop: 4, marginBottom: 20 }}>
+        Activating moves this project from Draft to Active. It will start contributing to the cashflow grid.
+        You can still edit any field on the project detail page afterwards.
+      </p>
+
+      <div style={{ background: C.bg, padding: 16, borderRadius: 6, marginBottom: 16, border: `1px solid ${C.line}` }}>
+        <Row><FieldLabel>Project</FieldLabel><ReadOnlyValue value={project.name} /></Row>
+        <Row><FieldLabel>Number</FieldLabel><ReadOnlyValue value={project.number || '—'} /></Row>
+        <Row><FieldLabel>Value</FieldLabel><ReadOnlyValue value={`£${fmtMoney(project.value)}`} /></Row>
+        <Row><FieldLabel>Retention</FieldLabel><ReadOnlyValue value={fmtPct(project.retention_pct)} /></Row>
+        <Row><FieldLabel>Type</FieldLabel><ReadOnlyValue value={project.payment_type === 'stage' ? 'Stage payment' : 'Valuation'} /></Row>
+      </div>
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 20 }}>
+        <button onClick={onBack} style={btnGhost()}>← Back</button>
+        <button onClick={activate} disabled={busy} style={btn(busy)}>
+          {busy ? 'Activating…' : 'Activate project'}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+// ============================================================
+// FORM PRIMITIVES (new in Stage 3)
+// ============================================================
+function DateInput({ value, onChange, placeholder, disabled }) {
+  return (
+    <input
+      type="date"
+      value={value || ''}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+      placeholder={placeholder}
+      style={{ ...inp(disabled), fontFamily: 'inherit' }}
+    />
+  );
+}
+
+function NumberInput({ value, onChange, step, placeholder, align, disabled }) {
+  return (
+    <input
+      type="number"
+      value={value == null ? '' : value}
+      onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
+      disabled={disabled}
+      step={step || '0.01'}
+      placeholder={placeholder == null ? '' : placeholder}
+      style={{ ...inp(disabled), textAlign: align || 'left', fontVariantNumeric: 'tabular-nums' }}
+    />
+  );
+}
+
+function MoneyInput({ value, onChange, disabled }) {
+  // £ prefix is decorative; the underlying value is a plain number.
+  return (
+    <div style={{ display: 'flex', alignItems: 'stretch' }}>
+      <span style={{
+        display: 'inline-flex', alignItems: 'center', padding: '0 10px',
+        background: C.bg, border: `1px solid ${C.line}`, borderRight: 'none',
+        borderRadius: '4px 0 0 4px', fontSize: 13, color: C.muted,
+      }}>£</span>
+      <input
+        type="number"
+        value={value == null ? '' : value}
+        onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
+        disabled={disabled}
+        step="0.01"
+        style={{
+          ...inp(disabled), textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+          borderRadius: '0 4px 4px 0',
+        }}
+        placeholder="0.00"
+      />
+    </div>
+  );
+}
+
+function twoCol() {
+  return { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 };
+}
+function threeCol() {
+  return { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 };
+}
 
 function SettingsHub({ access }) {
   return (
