@@ -78,9 +78,10 @@ const EDGE_FN = (name) => `${SUPABASE_URL}/functions/v1/${name}`;
 // ============================================================
 const C = {
   red: '#8C002A', redDark: '#660020', redLight: '#F4D9DD', redMid: '#E8C0C8', redSoft: '#FCF5F6',
-  prussian: '#183B4F', prussianLight: '#D9E0E5',
+  prussian: '#183B4F', prussianLight: '#D9E0E5', prussianMid: '#A8B6C0',
   ink: '#000000', text: '#2A2A2A', muted: '#6B6B6B', line: '#E5E0E2',
   bg: '#FAF7F8', white: '#FFFFFF',
+  neutralLight: '#EDE9EA', neutralMid: '#C9C0C2',
   green: '#2E7D32', greenLight: '#E8F5E9',
   amber: '#B07308', amberLight: '#FBF1D9',
   blue: '#183B4F', blueLight: '#D9E0E5',
@@ -1120,9 +1121,48 @@ function CashflowPage({ access }) {
     display: 'inline-block',
   };
 
-  // Helper that returns either the rotated wrapper or a plain span based on zoom.
-  const CellText = ({ children, style }) => {
-    if (zoomConfig.rotated) {
+  // CellText handles the cell content rendering with two modes:
+  //   - zoomConfig.rotated = true (26w/52w): always rotate
+  //   - zoomConfig.rotated = false (13w): rotate ONLY if the text is wider than
+  //     the cell can hold. This kicks in for million-pound values that would
+  //     otherwise overflow.
+  //
+  // The overflow check is heuristic, based on character count vs cell width. At
+  // 12px tabular-nums, one digit/comma/£ glyph ≈ 7px. Add 8px of horizontal
+  // padding (4px × 2). So for a 13w cell of weekMin 75px, the budget is
+  // (75 - 8) / 7 ≈ 9 chars. We use a slightly conservative 8 to avoid edge cases.
+  //
+  // Heuristic > runtime measurement because:
+  //   - no layout thrashing (no refs, no effect-after-render)
+  //   - deterministic (renders the same on every paint)
+  //   - the variance from precise measurement is negligible at 12px
+  const CELL_CHAR_BUDGET_13W = 8;
+
+  const cellTextOverflows = (str) => {
+    if (zoomConfig.rotated) return false; // already rotated
+    return String(str || '').length > CELL_CHAR_BUDGET_13W;
+  };
+
+  // Computes the row minHeight needed to fit any rotated value in the row.
+  // Returns null if no rotation is needed in the row (natural height is fine).
+  // At 12px tabular-nums, rotated text height ≈ chars × 7px + padding.
+  const rowMinHeightFor = (formattedValues) => {
+    if (zoomConfig.rotated) return zoomConfig.rowHeight;
+    let maxChars = 0;
+    for (const v of formattedValues) {
+      const len = String(v || '').length;
+      if (len > maxChars) maxChars = len;
+    }
+    if (maxChars <= CELL_CHAR_BUDGET_13W) return null; // no overflow
+    return Math.max(40, maxChars * 7 + 16); // chars × glyph width + padding
+  };
+
+  const CellText = ({ children, style, autoRotate }) => {
+    // Decide rotation: always rotate when zoom is rotated; otherwise rotate
+    // selectively if autoRotate=true AND the rendered string overflows.
+    const text = typeof children === 'string' ? children : '';
+    const shouldRotate = zoomConfig.rotated || (autoRotate && cellTextOverflows(text));
+    if (shouldRotate) {
       return <span style={{ ...rotatedTextStyle, ...(style || {}) }}>{children}</span>;
     }
     return <span style={style}>{children}</span>;
@@ -1333,13 +1373,21 @@ function CashflowPage({ access }) {
               {/* Project rows */}
               {qualifyingProjects.map(p => {
                 const row = grid.perProject[p.id];
+                // Determine if any cell in this row would overflow at 13w, so we can
+                // grow the row to accommodate rotated text in the overflowing cells.
+                const rowValues = [
+                  ...weekColumns.map(wk => fmtCellAmount(row.weeks[wk].total)),
+                  fmtCellAmount(row.rowTotal),
+                ];
+                const rowMinHeight = rowMinHeightFor(rowValues);
+                const cellJustify = rowMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
                 return (
                   <div key={p.id} style={{
                     display: 'grid',
                     gridTemplateColumns: gridCols,
                     borderBottom: `1px solid ${C.line}`,
                     fontVariantNumeric: 'tabular-nums',
-                    minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
+                    minHeight: rowMinHeight || undefined,
                   }}>
                     <div style={{
                       padding: '8px', overflow: 'hidden', minWidth: 0,
@@ -1386,13 +1434,13 @@ function CashflowPage({ access }) {
                             minWidth: 0,
                             display: 'flex',
                             alignItems: 'center',
-                            justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                            justifyContent: cellJustify,
                           }}
                           title={hasEvents
                             ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view`
                             : ''}
                         >
-                          <CellText>{fmtCellAmount(cell.total)}</CellText>
+                          <CellText autoRotate>{fmtCellAmount(cell.total)}</CellText>
                         </button>
                       );
                     })}
@@ -1403,24 +1451,31 @@ function CashflowPage({ access }) {
                       overflow: 'hidden', minWidth: 0,
                       display: 'flex',
                       alignItems: 'center',
-                      justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                      justifyContent: cellJustify,
                     }}
                       title={`£${fmtMoney(row.rowTotal)}`}
                     >
-                      <CellText>{fmtCellAmount(row.rowTotal)}</CellText>
+                      <CellText autoRotate>{fmtCellAmount(row.rowTotal)}</CellText>
                     </div>
                   </div>
                 );
               })}
 
               {/* Other debtors row — synthetic, shows aggregated unmatched-debtor events */}
-              {grid.unmatched.hasAny && (
+              {grid.unmatched.hasAny && (() => {
+                const odValues = [
+                  ...weekColumns.map(wk => fmtCellAmount((grid.unmatched.weeks[wk] && grid.unmatched.weeks[wk].total) || 0)),
+                  fmtCellAmount(grid.unmatched.rowTotal),
+                ];
+                const odMinHeight = rowMinHeightFor(odValues);
+                const odJustify = odMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                return (
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: gridCols,
                   borderBottom: `1px solid ${C.line}`,
                   fontVariantNumeric: 'tabular-nums',
-                  minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
+                  minHeight: odMinHeight || undefined,
                 }}>
                   <div style={{
                     padding: '8px', overflow: 'hidden', minWidth: 0,
@@ -1459,13 +1514,13 @@ function CashflowPage({ access }) {
                           overflow: 'hidden', minWidth: 0,
                           display: 'flex',
                           alignItems: 'center',
-                          justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                          justifyContent: odJustify,
                         }}
                         title={hasEvents
                           ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'}`
                           : ''}
                       >
-                        <CellText>{fmtCellAmount(cell.total)}</CellText>
+                        <CellText autoRotate>{fmtCellAmount(cell.total)}</CellText>
                       </button>
                     );
                   })}
@@ -1476,22 +1531,31 @@ function CashflowPage({ access }) {
                     overflow: 'hidden', minWidth: 0,
                     display: 'flex',
                     alignItems: 'center',
-                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                    justifyContent: odJustify,
                   }}
                     title={`£${fmtMoney(grid.unmatched.rowTotal)}`}
                   >
-                    <CellText>{fmtCellAmount(grid.unmatched.rowTotal)}</CellText>
+                    <CellText autoRotate>{fmtCellAmount(grid.unmatched.rowTotal)}</CellText>
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {/* Week totals row */}
+              {(() => {
+                const wtValues = [
+                  ...weekColumns.map(wk => fmtCellAmount(grid.weekTotals[wk] || 0)),
+                  fmtCellAmount(grid.grandTotal),
+                ];
+                const wtMinHeight = rowMinHeightFor(wtValues);
+                const wtJustify = wtMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                return (
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: gridCols,
                 background: C.redSoft, borderTop: `2px solid ${C.line}`,
                 fontWeight: 700, fontVariantNumeric: 'tabular-nums',
-                minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
+                minHeight: wtMinHeight || undefined,
               }}>
                 <div style={{
                   padding: '10px 8px', color: C.red, fontSize: 12,
@@ -1506,11 +1570,11 @@ function CashflowPage({ access }) {
                     overflow: 'hidden', minWidth: 0,
                     fontSize: zoomConfig.fontSize,
                     display: 'flex', alignItems: 'center',
-                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                    justifyContent: wtJustify,
                   }}
                     title={grid.weekTotals[wk] ? `£${fmtMoney(grid.weekTotals[wk])}` : ''}
                   >
-                    <CellText>{fmtCellAmount(grid.weekTotals[wk] || 0)}</CellText>
+                    <CellText autoRotate>{fmtCellAmount(grid.weekTotals[wk] || 0)}</CellText>
                   </div>
                 ))}
                 <div style={{
@@ -1519,25 +1583,33 @@ function CashflowPage({ access }) {
                   fontSize: zoomConfig.fontSize,
                   overflow: 'hidden', minWidth: 0,
                   display: 'flex', alignItems: 'center',
-                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                  justifyContent: wtJustify,
                 }}
                   title={`£${fmtMoney(grid.grandTotal)}`}
                 >
-                  <CellText>{fmtCellAmount(grid.grandTotal)}</CellText>
+                  <CellText autoRotate>{fmtCellAmount(grid.grandTotal)}</CellText>
                 </div>
               </div>
+                );
+              })()}
 
-              {/* Running balance row */}
+              {/* Running balance row — neutral grey background to differentiate
+                  from debtor cells (which use prussian-light). */}
+              {(() => {
+                const rbValues = runningBalance.map(b => fmtCellAmount(b));
+                const rbMinHeight = rowMinHeightFor(rbValues);
+                const rbJustify = rbMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                return (
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: gridCols,
-                background: C.prussianLight,
+                background: C.neutralLight,
                 fontWeight: 700, fontVariantNumeric: 'tabular-nums',
                 borderTop: `1px solid ${C.line}`,
-                minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
+                minHeight: rbMinHeight || undefined,
               }}>
                 <div style={{
-                  padding: '10px 8px', color: C.prussian, fontSize: 12,
+                  padding: '10px 8px', color: C.text, fontSize: 12,
                   borderRight: `3px solid ${C.red}`,
                   display: 'flex', flexDirection: 'column', justifyContent: 'center',
                 }}>
@@ -1549,31 +1621,33 @@ function CashflowPage({ access }) {
                 {runningBalance.map((bal, i) => (
                   <div key={i} style={{
                     padding: zoomConfig.rotated ? '6px 0' : '10px 4px',
-                    color: bal < 0 ? C.redStatus : C.prussian,
+                    color: bal < 0 ? C.redStatus : C.text,
                     borderRight: `1px solid ${C.line}`,
                     overflow: 'hidden', minWidth: 0,
                     fontSize: zoomConfig.fontSize,
                     display: 'flex', alignItems: 'center',
-                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                    justifyContent: rbJustify,
                   }}
                     title={`£${fmtMoney(bal)}`}
                   >
-                    <CellText>{fmtCellAmount(bal)}</CellText>
+                    <CellText autoRotate>{fmtCellAmount(bal)}</CellText>
                   </div>
                 ))}
                 <div style={{
                   padding: zoomConfig.rotated ? '6px 0' : '10px 6px',
-                  color: textColorForValue(runningBalance[runningBalance.length - 1], C.prussian),
+                  color: textColorForValue(runningBalance[runningBalance.length - 1], C.text),
                   fontSize: zoomConfig.fontSize,
                   overflow: 'hidden', minWidth: 0,
                   display: 'flex', alignItems: 'center',
-                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                  justifyContent: rbJustify,
                 }}
                   title={`£${fmtMoney(runningBalance[runningBalance.length - 1])}`}
                 >
-                  <CellText>{fmtCellAmount(runningBalance[runningBalance.length - 1])}</CellText>
+                  <CellText autoRotate>{fmtCellAmount(runningBalance[runningBalance.length - 1])}</CellText>
                 </div>
               </div>
+                );
+              })()}
             </div>
           </div>
 
