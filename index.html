@@ -49,6 +49,7 @@
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
 <script type="text/babel" data-presets="env,react">
 // ============================================================
@@ -745,7 +746,609 @@ function StubPage({ title, subtitle, children }) {
   );
 }
 
-function CashflowPage({ access })       { return <StubPage title="Master cashflow" subtitle="Weekly grid of money in and overheads out.">Cashflow grid — Stage 5.</StubPage>; }
+// ============================================================
+// MASTER CASHFLOW PAGE (editor-only)
+// Aggregates every qualifying project's cash events into a weekly grid.
+// "Qualifying" = active projects, OR completed projects with unreleased retention.
+// ============================================================
+function CashflowPage({ access }) {
+  const [projects, setProjects] = useState(null);
+  const [invoicesByProject, setInvoicesByProject] = useState({});
+  const [releasesByProject, setReleasesByProject] = useState({});
+  const [settings, setSettings] = useState(null);
+  const [windowWeeks, setWindowWeeks] = useState(13);
+  const [error, setError] = useState(null);
+  const [drillCell, setDrillCell] = useState(null); // { weekStart, events }
+  const [editingOB, setEditingOB] = useState(false);
+
+  // Load everything in parallel
+  useEffect(() => {
+    (async () => {
+      try {
+        const [allProjects, settingsRows] = await Promise.all([
+          // Pull all non-archived non-draft projects — we'll filter to "qualifying" below
+          sbSelect('projects',
+            `select=*&status=in.(active,complete)&order=name.asc`,
+            access.session),
+          sbSelect('cashflow_settings',
+            `singleton=eq.cashflow&limit=1`,
+            access.session),
+        ]);
+
+        // Fetch invoices + releases for ALL of these projects in two queries
+        if (allProjects.length === 0) {
+          setProjects([]);
+          setInvoicesByProject({});
+          setReleasesByProject({});
+        } else {
+          const idList = allProjects.map(p => `"${p.id}"`).join(',');
+          const [invoices, releases] = await Promise.all([
+            sbSelect('project_invoices', `project_id=in.(${idList})&order=sequence.asc`, access.session),
+            sbSelect('project_retention_releases', `project_id=in.(${idList})&order=release_date.asc`, access.session),
+          ]);
+          // Bucket by project id
+          const invs = {}, rels = {};
+          for (const inv of invoices) {
+            (invs[inv.project_id] = invs[inv.project_id] || []).push(inv);
+          }
+          for (const r of releases) {
+            (rels[r.project_id] = rels[r.project_id] || []).push(r);
+          }
+          setProjects(allProjects);
+          setInvoicesByProject(invs);
+          setReleasesByProject(rels);
+        }
+
+        if (settingsRows && settingsRows[0]) {
+          setSettings(settingsRows[0]);
+        } else {
+          // Should never happen if migration was run, but fall back to defaults
+          setSettings({ singleton: 'cashflow', opening_balance: 0, opening_as_of_date: new Date().toISOString().slice(0, 10) });
+        }
+      } catch (e) { setError(e.message); }
+    })();
+  }, [access.session]);
+
+  // Filter projects: keep active + (complete with unreleased retention)
+  const qualifyingProjects = useMemo(() => {
+    if (!projects) return null;
+    return projects.filter(p => {
+      if (p.status === 'active') return true;
+      if (p.status === 'complete') {
+        // Has remaining retention?
+        const invs = invoicesByProject[p.id] || [];
+        const rels = releasesByProject[p.id] || [];
+        const retPct = Number(p.retention_pct) || 0;
+        if (retPct === 0) return false;
+        const pv = Number(p.value) || 0;
+        const withheld = invs.reduce((s, inv) => {
+          let gross = 0;
+          if (inv.invoice_pct != null) gross = (Number(inv.invoice_pct) / 100) * pv;
+          else if (inv.invoice_value_net != null) gross = Number(inv.invoice_value_net);
+          return s + gross * (retPct / 100);
+        }, 0);
+        const released = rels.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+        return (withheld - released) > 0.01;
+      }
+      return false;
+    });
+  }, [projects, invoicesByProject, releasesByProject]);
+
+  // Build the week-column array. Window starts on the Monday of "as of date" (or today).
+  const weekColumns = useMemo(() => {
+    const anchor = settings ? settings.opening_as_of_date : new Date().toISOString().slice(0, 10);
+    const startMon = mondayOf(anchor);
+    const cols = [];
+    for (let i = 0; i < windowWeeks; i++) cols.push(addDays(startMon, i * 7));
+    return cols;
+  }, [settings, windowWeeks]);
+
+  // Compute the per-project per-week cell totals + drill-through event lists
+  const grid = useMemo(() => {
+    if (!qualifyingProjects) return null;
+    const result = {
+      // perProject[projectId] = { weeks: { [mondayISO]: { total, events: [...] } }, rowTotal, past, future }
+      perProject: {},
+      weekTotals: {},   // [mondayISO] = number
+      grandTotal: 0,
+      pastTotal: 0,     // events before window
+      futureTotal: 0,   // events after window
+    };
+    const windowStart = weekColumns[0];
+    const windowEnd = addDays(weekColumns[weekColumns.length - 1], 7); // exclusive
+
+    for (const p of qualifyingProjects) {
+      const events = projectCashEvents(p, invoicesByProject[p.id] || [], releasesByProject[p.id] || []);
+      const row = { weeks: {}, rowTotal: 0, past: 0, future: 0 };
+      for (const wk of weekColumns) row.weeks[wk] = { total: 0, events: [] };
+      for (const ev of events) {
+        if (cmpDate(ev.date, windowStart) < 0) {
+          row.past += ev.gross;
+          result.pastTotal += ev.gross;
+          continue;
+        }
+        if (cmpDate(ev.date, windowEnd) >= 0) {
+          row.future += ev.gross;
+          result.futureTotal += ev.gross;
+          continue;
+        }
+        const wk = mondayOf(ev.date);
+        if (!row.weeks[wk]) row.weeks[wk] = { total: 0, events: [] };
+        row.weeks[wk].total += ev.gross;
+        row.weeks[wk].events.push({ ...ev, project: p });
+        row.rowTotal += ev.gross;
+        result.weekTotals[wk] = (result.weekTotals[wk] || 0) + ev.gross;
+        result.grandTotal += ev.gross;
+      }
+      result.perProject[p.id] = row;
+    }
+    return result;
+  }, [qualifyingProjects, invoicesByProject, releasesByProject, weekColumns]);
+
+  // Running balance row: opening balance + cumulative weekly inflows
+  const runningBalance = useMemo(() => {
+    if (!grid || !settings) return null;
+    const ob = Number(settings.opening_balance) || 0;
+    let bal = ob;
+    const balances = [];
+    for (const wk of weekColumns) {
+      bal += (grid.weekTotals[wk] || 0);
+      balances.push(bal);
+    }
+    return balances;
+  }, [grid, settings, weekColumns]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (projects === null || settings === null) return <LoadingMsg label="Loading cashflow…" />;
+
+  // Opening balance save handler
+  const saveOpeningBalance = async (newBalance, newAsOfDate) => {
+    try {
+      const updated = await sbUpdate('cashflow_settings', `singleton=eq.cashflow`, {
+        opening_balance: newBalance,
+        opening_as_of_date: newAsOfDate,
+        updated_at: new Date().toISOString(),
+        updated_by_email: getEmail(access.session),
+      }, access.session);
+      if (updated && updated[0]) setSettings(updated[0]);
+      setEditingOB(false);
+    } catch (e) {
+      alert('Could not save opening balance: ' + e.message);
+    }
+  };
+
+  const openDrill = (weekStart, projectName, events) => {
+    setDrillCell({ weekStart, projectName, events });
+  };
+
+  // Export handlers
+  const exportRows = () => {
+    // Returns array-of-arrays for CSV/XLSX consumption
+    const headerRow = ['Project', 'Status', ...weekColumns.map(wk => `Wk of ${fmtDateShort(wk)}`), 'Total'];
+    const rows = [headerRow];
+    for (const p of qualifyingProjects) {
+      const row = grid.perProject[p.id];
+      const cells = [
+        p.name + (p.number ? ` (${p.number})` : ''),
+        p.status,
+        ...weekColumns.map(wk => row.weeks[wk].total || 0),
+        row.rowTotal,
+      ];
+      rows.push(cells);
+    }
+    // Totals
+    rows.push([
+      'Week total', '',
+      ...weekColumns.map(wk => grid.weekTotals[wk] || 0),
+      grid.grandTotal,
+    ]);
+    // Running balance
+    rows.push([
+      `Running balance (from £${fmtMoney(settings.opening_balance)} on ${fmtDateShort(settings.opening_as_of_date)})`, '',
+      ...runningBalance,
+      runningBalance[runningBalance.length - 1],
+    ]);
+    return rows;
+  };
+
+  const exportCsv = () => {
+    const rows = exportRows();
+    const csv = rows.map(r =>
+      r.map(cell => {
+        if (cell == null) return '';
+        const s = typeof cell === 'number' ? cell.toFixed(2) : String(cell);
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return '"' + s.replace(/"/g, '""') + '"';
+        }
+        return s;
+      }).join(',')
+    ).join('\n');
+    downloadBlob(csv, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv;charset=utf-8');
+  };
+
+  const exportXlsx = () => {
+    if (typeof XLSX === 'undefined') {
+      alert('XLSX library not loaded. Try refreshing the page.');
+      return;
+    }
+    const rows = exportRows();
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    // Apply column widths
+    ws['!cols'] = [
+      { wch: 32 }, // project
+      { wch: 10 }, // status
+      ...weekColumns.map(() => ({ wch: 14 })),
+      { wch: 14 }, // total
+    ];
+    XLSX.utils.book_append_sheet(wb, ws, 'Cashflow');
+    XLSX.writeFile(wb, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  // Cell width — sized to fit comfortable money amounts. Project name column is wider.
+  const PROJECT_COL = 240;
+  const TOTAL_COL = 110;
+  const WEEK_COL = 100;
+  const totalWidth = PROJECT_COL + (weekColumns.length * WEEK_COL) + TOTAL_COL;
+
+  return (
+    <div style={{ maxWidth: 1280 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, marginBottom: 20 }}>
+        <div>
+          <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Cashflow</h1>
+          <div style={{ fontSize: 13, color: C.muted }}>
+            Weekly view across {qualifyingProjects.length} project{qualifyingProjects.length === 1 ? '' : 's'}.
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <WindowPicker value={windowWeeks} onChange={setWindowWeeks} />
+          <button onClick={exportCsv} style={btnGhost()} title="Download as CSV">↓ CSV</button>
+          <button onClick={exportXlsx} style={btnGhost()} title="Download as Excel">↓ XLSX</button>
+        </div>
+      </div>
+
+      <OpeningBalanceCard
+        settings={settings}
+        editing={editingOB}
+        onEdit={() => setEditingOB(true)}
+        onCancel={() => setEditingOB(false)}
+        onSave={saveOpeningBalance}
+      />
+
+      {qualifyingProjects.length === 0 ? (
+        <SectionBox title="Cashflow grid">
+          <div style={{ padding: 30, textAlign: 'center', color: C.muted, fontSize: 13 }}>
+            No active projects to display.
+          </div>
+        </SectionBox>
+      ) : (
+        <SectionBox
+          title="Cashflow grid"
+          actions={
+            <span style={{ fontSize: 11, color: C.muted }}>
+              Click any cell for breakdown
+            </span>
+          }
+        >
+          {grid.pastTotal > 0 && (
+            <div style={{ fontSize: 12, color: C.muted, padding: '6px 10px', background: C.bg, borderRadius: 4, marginBottom: 10 }}>
+              {Object.values(grid.perProject).reduce((s, r) => s + (r.past > 0 ? 1 : 0), 0)} project{Object.values(grid.perProject).filter(r => r.past > 0).length === 1 ? ' has' : 's have'} cash events before the window — totalling £{fmtMoney(grid.pastTotal)}
+            </div>
+          )}
+
+          <div style={{ overflowX: 'auto' }}>
+            <div style={{ minWidth: totalWidth }}>
+              {/* Header row */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
+                padding: '8px 4px', borderBottom: `2px solid ${C.line}`,
+              }}>
+                <div style={{ padding: '0 8px' }}>Project</div>
+                {weekColumns.map(wk => (
+                  <div key={wk} style={{ textAlign: 'right', padding: '0 8px' }}>
+                    {fmtDateShort(wk).replace(/, 20\d\d/, '')}
+                  </div>
+                ))}
+                <div style={{ textAlign: 'right', padding: '0 8px' }}>Total</div>
+              </div>
+
+              {/* Project rows */}
+              {qualifyingProjects.map(p => {
+                const row = grid.perProject[p.id];
+                return (
+                  <div key={p.id} style={{
+                    display: 'grid',
+                    gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                    borderBottom: `1px solid ${C.line}`,
+                    fontSize: 12, fontVariantNumeric: 'tabular-nums',
+                  }}>
+                    <div style={{ padding: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <a href={buildHash(['projects', p.id])} style={{ color: C.text, fontWeight: 600, textDecoration: 'none' }}>
+                        {p.name}
+                      </a>
+                      {p.status === 'complete' && (
+                        <span style={{ fontSize: 10, color: C.muted, marginLeft: 6, fontStyle: 'italic' }}>(retention only)</span>
+                      )}
+                      {p.number && <div style={{ fontSize: 10, color: C.muted, fontFamily: 'monospace' }}>{p.number}</div>}
+                    </div>
+                    {weekColumns.map(wk => {
+                      const cell = row.weeks[wk];
+                      const hasEvents = cell.events.length > 0;
+                      return (
+                        <button
+                          key={wk}
+                          onClick={hasEvents ? () => openDrill(wk, p.name, cell.events) : undefined}
+                          disabled={!hasEvents}
+                          style={{
+                            border: 'none', background: hasEvents ? C.greenLight : 'transparent',
+                            cursor: hasEvents ? 'pointer' : 'default',
+                            textAlign: 'right', padding: '8px 8px',
+                            fontFamily: 'inherit', fontSize: 12,
+                            color: hasEvents ? C.text : C.line,
+                            fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
+                            borderRight: `1px solid ${C.line}`,
+                          }}
+                          title={hasEvents ? `${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view` : ''}
+                        >
+                          {hasEvents ? `£${fmtMoney(cell.total)}` : '—'}
+                        </button>
+                      );
+                    })}
+                    <div style={{
+                      padding: '8px', textAlign: 'right', fontWeight: 700, color: C.text,
+                      background: C.bg,
+                    }}>
+                      £{fmtMoney(row.rowTotal)}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Week totals row */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                background: C.redSoft, borderTop: `2px solid ${C.line}`,
+                fontSize: 12, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
+              }}>
+                <div style={{ padding: '10px 8px', color: C.red }}>Week totals</div>
+                {weekColumns.map(wk => (
+                  <div key={wk} style={{ padding: '10px 8px', textAlign: 'right', color: C.text, borderRight: `1px solid ${C.line}` }}>
+                    {grid.weekTotals[wk] ? `£${fmtMoney(grid.weekTotals[wk])}` : '—'}
+                  </div>
+                ))}
+                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.green }}>
+                  £{fmtMoney(grid.grandTotal)}
+                </div>
+              </div>
+
+              {/* Running balance row */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                background: C.prussianLight,
+                fontSize: 12, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
+              }}>
+                <div style={{ padding: '10px 8px', color: C.prussian }}>
+                  Running balance
+                  <div style={{ fontSize: 10, fontWeight: 500, color: C.muted }}>
+                    from £{fmtMoney(settings.opening_balance)} on {fmtDateShort(settings.opening_as_of_date)}
+                  </div>
+                </div>
+                {runningBalance.map((bal, i) => (
+                  <div key={i} style={{
+                    padding: '10px 8px', textAlign: 'right',
+                    color: bal < 0 ? C.redStatus : C.prussian,
+                    borderRight: `1px solid ${C.line}`,
+                  }}>
+                    £{fmtMoney(bal)}
+                  </div>
+                ))}
+                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.prussian }}>
+                  £{fmtMoney(runningBalance[runningBalance.length - 1])}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {grid.futureTotal > 0 && (
+            <div style={{ fontSize: 12, color: C.muted, padding: '6px 10px', background: C.bg, borderRadius: 4, marginTop: 10 }}>
+              {Object.values(grid.perProject).filter(r => r.future > 0).length} project{Object.values(grid.perProject).filter(r => r.future > 0).length === 1 ? ' has' : 's have'} cash events after the window — totalling £{fmtMoney(grid.futureTotal)}
+            </div>
+          )}
+        </SectionBox>
+      )}
+
+      {drillCell && <CashflowDrillModal drill={drillCell} onClose={() => setDrillCell(null)} />}
+    </div>
+  );
+}
+
+// ============================================================
+// OPENING BALANCE CARD
+// ============================================================
+function OpeningBalanceCard({ settings, editing, onEdit, onCancel, onSave }) {
+  const [draftBalance, setDraftBalance] = useState(settings.opening_balance);
+  const [draftDate, setDraftDate] = useState(settings.opening_as_of_date);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (editing) {
+      setDraftBalance(settings.opening_balance);
+      setDraftDate(settings.opening_as_of_date);
+    }
+  }, [editing, settings]);
+
+  const save = async () => {
+    if (!draftDate) { alert('Date is required.'); return; }
+    setBusy(true);
+    try {
+      await onSave(Number(draftBalance) || 0, draftDate);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <SectionBox
+      title="Opening balance"
+      actions={
+        !editing && <button onClick={onEdit} style={miniBtn()}>✎ Edit</button>
+      }
+    >
+      {!editing ? (
+        <div style={{ display: 'flex', gap: 32, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Bank balance</div>
+            <div style={{ fontSize: 24, fontWeight: 700, color: C.text, fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
+              £{fmtMoney(settings.opening_balance)}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>As of</div>
+            <div style={{ fontSize: 16, color: C.text, marginTop: 2 }}>{fmtDateShort(settings.opening_as_of_date)}</div>
+          </div>
+          {settings.updated_at && settings.updated_by_email && (
+            <div style={{ fontSize: 11, color: C.muted, alignSelf: 'flex-end' }}>
+              Last updated {timeAgo(settings.updated_at)} by {settings.updated_by_email}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 14 }}>
+            <Field label="Bank balance (£)">
+              <MoneyInput value={draftBalance} onChange={setDraftBalance} />
+            </Field>
+            <Field label="As of date">
+              <DateField value={draftDate} onChange={setDraftDate} />
+            </Field>
+          </div>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 14, fontStyle: 'italic' }}>
+            The cashflow grid starts from the Monday of this date. Update this anytime you reconcile against the bank.
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button onClick={onCancel} disabled={busy} style={btnGhost()}>Cancel</button>
+            <button onClick={save} disabled={busy} style={btn(busy)}>
+              {busy ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// WINDOW PICKER (13/26/52 weeks)
+// ============================================================
+function WindowPicker({ value, onChange }) {
+  return (
+    <div style={{ display: 'inline-flex', border: `1px solid ${C.line}`, borderRadius: 6, overflow: 'hidden' }}>
+      {[13, 26, 52].map((opt, i) => (
+        <button
+          key={opt}
+          onClick={() => onChange(opt)}
+          style={{
+            padding: '8px 14px', fontSize: 12, fontFamily: 'inherit', fontWeight: 600,
+            background: value === opt ? C.red : C.white,
+            color: value === opt ? C.white : C.text,
+            border: 'none',
+            borderLeft: i === 0 ? 'none' : `1px solid ${C.line}`,
+            cursor: 'pointer',
+          }}
+        >
+          {opt}w
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================
+// DRILL MODAL — when a cashflow cell is clicked
+// ============================================================
+function CashflowDrillModal({ drill, onClose }) {
+  const total = drill.events.reduce((s, e) => s + e.gross, 0);
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 580 }}>
+        <h2 style={{
+          fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+          color: C.red, marginTop: 0, marginBottom: 4, fontWeight: 700, fontSize: 20,
+        }}>
+          {drill.projectName}
+        </h2>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 18 }}>
+          Week starting {fmtDateShort(drill.weekStart)} · {drill.events.length} event{drill.events.length === 1 ? '' : 's'} · £{fmtMoney(total)} total
+        </div>
+        <div>
+          {drill.events.map((ev, i) => (
+            <div key={i} style={{
+              padding: '10px 0', borderBottom: i === drill.events.length - 1 ? 'none' : `1px solid ${C.line}`,
+              display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12,
+            }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{ev.label}</div>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                  Lands {fmtDateShort(ev.date)} ·
+                  <span style={{
+                    marginLeft: 4,
+                    color: ev.source === 'retention' ? C.amber : C.green,
+                    fontWeight: 600,
+                  }}>
+                    {ev.source === 'retention' ? 'Retention release' : 'Invoice payment'}
+                  </span>
+                </div>
+                {ev.breakdown && (
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                    {ev.source === 'invoice' && (
+                      <span>
+                        £{fmtMoney(ev.breakdown.gross)} gross
+                        {ev.breakdown.retention > 0 && <span> · −£{fmtMoney(ev.breakdown.retention)} retention</span>}
+                        {' · '}£{fmtMoney(ev.breakdown.claim)} claim
+                        {' · +£'}{fmtMoney(ev.breakdown.vat)} VAT
+                      </span>
+                    )}
+                    {ev.source === 'retention' && (
+                      <span>£{fmtMoney(ev.breakdown.amount)} + £{fmtMoney(ev.breakdown.vat)} VAT</span>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.green, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                £{fmtMoney(ev.gross)}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 20, paddingTop: 14, borderTop: `2px solid ${C.line}` }}>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>Week total</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.green, fontVariantNumeric: 'tabular-nums' }}>
+            £{fmtMoney(total)}
+          </div>
+        </div>
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <button onClick={onClose} style={btn(false)}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Trigger a browser download of a string as a file. Used for CSV export.
+function downloadBlob(text, filename, mime) {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ============================================================
 // PROJECT DETAIL PAGE
 // The home of an individual project after wizard completion.
