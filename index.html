@@ -518,8 +518,7 @@ function RouteSwitch({ route, navigate, access }) {
     return <ProjectsRegisterPage access={access} navigate={navigate} />;
   }
   if (seg === 'debtors') {
-    if (route.path[1] === 'import') return <DebtorImportStub />;
-    return <DebtorListStub />;
+    return <DebtorsPage access={access} />;
   }
   if (seg === 'overheads') return <OverheadListStub />;
   if (seg === 'settings') {
@@ -755,6 +754,7 @@ function CashflowPage({ access }) {
   const [projects, setProjects] = useState(null);
   const [invoicesByProject, setInvoicesByProject] = useState({});
   const [releasesByProject, setReleasesByProject] = useState({});
+  const [debtors, setDebtors] = useState(null);
   const [settings, setSettings] = useState(null);
   const [windowWeeks, setWindowWeeks] = useState(13);
   const [error, setError] = useState(null);
@@ -766,13 +766,17 @@ function CashflowPage({ access }) {
   useEffect(() => {
     (async () => {
       try {
-        const [allProjects, settingsRows] = await Promise.all([
+        const [allProjects, settingsRows, allDebtors] = await Promise.all([
           // Pull all non-archived non-draft projects — we'll filter to "qualifying" below
           sbSelect('projects',
             `select=*&status=in.(active,complete)&order=name.asc`,
             access.session),
           sbSelect('cashflow_settings',
             `singleton=eq.cashflow&limit=1`,
+            access.session),
+          // Outstanding debtors only — cleared ones aren't future cash
+          sbSelect('debtors',
+            `select=*&status=eq.outstanding&order=contact_name.asc`,
             access.session),
         ]);
 
@@ -799,6 +803,8 @@ function CashflowPage({ access }) {
           setInvoicesByProject(invs);
           setReleasesByProject(rels);
         }
+
+        setDebtors(allDebtors || []);
 
         if (settingsRows && settingsRows[0]) {
           setSettings(settingsRows[0]);
@@ -844,12 +850,17 @@ function CashflowPage({ access }) {
     return cols;
   }, [settings, windowWeeks]);
 
-  // Compute the per-project per-week cell totals + drill-through event lists
+  // Compute the per-project per-week cell totals + drill-through event lists.
+  // Includes debtor cash events:
+  //   - debtors linked to a project → folded into that project's row
+  //   - unmatched debtors → aggregated into a synthetic "Other debtors" row
   const grid = useMemo(() => {
-    if (!qualifyingProjects) return null;
+    if (!qualifyingProjects || debtors === null) return null;
     const result = {
       // perProject[projectId] = { weeks: { [mondayISO]: { total, events: [...] } }, rowTotal, past, future }
       perProject: {},
+      // Synthetic row for unmatched debtors (rendered as a pseudo-project row at the bottom)
+      unmatched: { weeks: {}, rowTotal: 0, past: 0, future: 0, hasAny: false },
       weekTotals: {},   // [mondayISO] = number
       grandTotal: 0,
       pastTotal: 0,     // events before window
@@ -858,33 +869,62 @@ function CashflowPage({ access }) {
     const windowStart = weekColumns[0];
     const windowEnd = addDays(weekColumns[weekColumns.length - 1], 7); // exclusive
 
+    // Group debtors by project_id (linked) and an 'unmatched' bucket (no project_id)
+    const debtorsByProject = {};
+    const unmatchedDebtors = [];
+    for (const d of (debtors || [])) {
+      if (d.project_id) {
+        (debtorsByProject[d.project_id] = debtorsByProject[d.project_id] || []).push(d);
+      } else {
+        unmatchedDebtors.push(d);
+      }
+    }
+
+    // Helper to drop an event into a row + tracking buckets
+    const placeEvent = (row, ev) => {
+      if (cmpDate(ev.date, windowStart) < 0) {
+        row.past += ev.gross;
+        result.pastTotal += ev.gross;
+        return;
+      }
+      if (cmpDate(ev.date, windowEnd) >= 0) {
+        row.future += ev.gross;
+        result.futureTotal += ev.gross;
+        return;
+      }
+      const wk = mondayOf(ev.date);
+      if (!row.weeks[wk]) row.weeks[wk] = { total: 0, events: [] };
+      row.weeks[wk].total += ev.gross;
+      row.weeks[wk].events.push(ev);
+      row.rowTotal += ev.gross;
+      result.weekTotals[wk] = (result.weekTotals[wk] || 0) + ev.gross;
+      result.grandTotal += ev.gross;
+    };
+
     for (const p of qualifyingProjects) {
-      const events = projectCashEvents(p, invoicesByProject[p.id] || [], releasesByProject[p.id] || []);
+      const projectEvents = projectCashEvents(p, invoicesByProject[p.id] || [], releasesByProject[p.id] || []);
+      const debtorEvents = (debtorsByProject[p.id] || []).flatMap(d => debtorCashEvents(d));
       const row = { weeks: {}, rowTotal: 0, past: 0, future: 0 };
       for (const wk of weekColumns) row.weeks[wk] = { total: 0, events: [] };
-      for (const ev of events) {
-        if (cmpDate(ev.date, windowStart) < 0) {
-          row.past += ev.gross;
-          result.pastTotal += ev.gross;
-          continue;
-        }
-        if (cmpDate(ev.date, windowEnd) >= 0) {
-          row.future += ev.gross;
-          result.futureTotal += ev.gross;
-          continue;
-        }
-        const wk = mondayOf(ev.date);
-        if (!row.weeks[wk]) row.weeks[wk] = { total: 0, events: [] };
-        row.weeks[wk].total += ev.gross;
-        row.weeks[wk].events.push({ ...ev, project: p });
-        row.rowTotal += ev.gross;
-        result.weekTotals[wk] = (result.weekTotals[wk] || 0) + ev.gross;
-        result.grandTotal += ev.gross;
+      for (const ev of [...projectEvents, ...debtorEvents]) {
+        placeEvent(row, { ...ev, project: p });
       }
       result.perProject[p.id] = row;
     }
+
+    // Unmatched debtors → synthetic row
+    if (unmatchedDebtors.length > 0) {
+      for (const wk of weekColumns) result.unmatched.weeks[wk] = { total: 0, events: [] };
+      for (const d of unmatchedDebtors) {
+        for (const ev of debtorCashEvents(d)) {
+          placeEvent(result.unmatched, ev);
+          result.unmatched.hasAny = true;
+        }
+      }
+    }
+
     return result;
-  }, [qualifyingProjects, invoicesByProject, releasesByProject, weekColumns]);
+  }, [qualifyingProjects, invoicesByProject, releasesByProject, debtors, weekColumns]);
 
   // Running balance row: opening balance + cumulative weekly inflows
   const runningBalance = useMemo(() => {
@@ -900,7 +940,7 @@ function CashflowPage({ access }) {
   }, [grid, settings, weekColumns]);
 
   if (error) return <ErrorMsg msg={error} />;
-  if (projects === null || settings === null) return <LoadingMsg label="Loading cashflow…" />;
+  if (projects === null || settings === null || debtors === null) return <LoadingMsg label="Loading cashflow…" />;
 
   // Opening balance save handler
   const saveOpeningBalance = async (newBalance, newAsOfDate) => {
@@ -942,6 +982,14 @@ function CashflowPage({ access }) {
         row.rowTotal,
       ];
       rows.push(cells);
+    }
+    // Other debtors row (only if there are any)
+    if (grid.unmatched.hasAny) {
+      rows.push([
+        'Other debtors', 'unmatched',
+        ...cols.map(wk => (grid.unmatched.weeks[wk] && grid.unmatched.weeks[wk].total) || 0),
+        grid.unmatched.rowTotal,
+      ]);
     }
     // Totals
     rows.push([
@@ -1315,6 +1363,77 @@ function CashflowPage({ access }) {
                 );
               })}
 
+              {/* Other debtors row — synthetic, shows aggregated unmatched-debtor events */}
+              {grid.unmatched.hasAny && (
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: gridCols,
+                  borderBottom: `1px solid ${C.line}`,
+                  fontVariantNumeric: 'tabular-nums',
+                  minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
+                  background: C.amberLight,
+                }}>
+                  <div style={{
+                    padding: '8px', overflow: 'hidden', minWidth: 0,
+                    borderRight: `3px solid ${C.red}`,
+                    display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                  }}>
+                    <a href={buildHash(['debtors'])} style={{
+                      color: C.amber, fontWeight: 700, textDecoration: 'none',
+                      fontSize: 13,
+                    }}>
+                      Other debtors
+                    </a>
+                    <span style={{ fontSize: 10, color: C.muted, fontStyle: 'italic' }}>
+                      unmatched aged receivables
+                    </span>
+                  </div>
+                  {weekColumns.map(wk => {
+                    const cell = grid.unmatched.weeks[wk] || { total: 0, events: [] };
+                    const hasEvents = cell.events.length > 0;
+                    return (
+                      <button
+                        key={wk}
+                        onClick={hasEvents ? () => openDrill(wk, 'Other debtors', cell.events) : undefined}
+                        disabled={!hasEvents}
+                        style={{
+                          border: 'none', background: hasEvents ? C.amberLight : 'transparent',
+                          cursor: hasEvents ? 'pointer' : 'default',
+                          padding: zoomConfig.rotated ? '6px 0' : '8px 4px',
+                          fontFamily: 'inherit',
+                          fontSize: zoomConfig.fontSize,
+                          color: hasEvents ? C.text : C.line,
+                          fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
+                          borderRight: `1px solid ${C.line}`,
+                          overflow: 'hidden', minWidth: 0,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                        }}
+                        title={hasEvents
+                          ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'}`
+                          : ''}
+                      >
+                        <CellText>{fmtCellAmount(cell.total)}</CellText>
+                      </button>
+                    );
+                  })}
+                  <div style={{
+                    padding: zoomConfig.rotated ? '6px 0' : '8px 6px',
+                    fontWeight: 700, color: C.text,
+                    background: C.bg, fontSize: zoomConfig.fontSize,
+                    overflow: 'hidden', minWidth: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                  }}
+                    title={`£${fmtMoney(grid.unmatched.rowTotal)}`}
+                  >
+                    <CellText>{fmtCellAmount(grid.unmatched.rowTotal)}</CellText>
+                  </div>
+                </div>
+              )}
+
               {/* Week totals row */}
               <div style={{
                 display: 'grid',
@@ -1548,10 +1667,14 @@ function CashflowDrillModal({ drill, onClose }) {
                   Lands {fmtDateShort(ev.date)} ·
                   <span style={{
                     marginLeft: 4,
-                    color: ev.source === 'retention' ? C.amber : C.green,
+                    color: ev.source === 'retention' ? C.amber
+                      : ev.source === 'debtor' ? C.prussian
+                      : C.green,
                     fontWeight: 600,
                   }}>
-                    {ev.source === 'retention' ? 'Retention release' : 'Invoice payment'}
+                    {ev.source === 'retention' ? 'Retention release'
+                      : ev.source === 'debtor' ? (ev.bucket === 'override' ? 'Debtor override' : `Debtor — ${BUCKET_LABELS[ev.bucket] || ev.bucket}`)
+                      : 'Invoice payment'}
                   </span>
                 </div>
                 {ev.breakdown && (
@@ -3313,8 +3436,917 @@ function SectionBox({ title, actions, children }) {
     </div>
   );
 }
-function DebtorListStub()               { return <StubPage title="Debtors" subtitle="Imported from CSV or added manually.">Debtor list — Stage 6.</StubPage>; }
-function DebtorImportStub()             { return <StubPage title="Import debtors" subtitle="Upload CSV, map columns, review, commit.">CSV import — Stage 6.</StubPage>; }
+// ============================================================
+// DEBTORS PAGE — aged-receivables view (editor-only)
+// ============================================================
+// Bucket-to-date heuristic — converts an aged-receivables bucket + snapshot
+// date into a predicted cash arrival date. Used both for display and for the
+// master cashflow grid.
+//
+// Sensible defaults (we'll make these editable globally later):
+//   current      → snapshot + 30 days (not yet due, paid on time)
+//   <1 month     → snapshot + 14 days (mild chase)
+//   1 month      → snapshot + 28 days (active chase)
+//   2 months     → snapshot + 45 days (serious chase)
+//   3 months     → snapshot + 75 days (escalation; bad-debt risk starts here)
+//   older        → snapshot + 120 days (high bad-debt risk; included but flagged)
+const BUCKET_OFFSET_DAYS = {
+  current:       30,
+  overdue_lt_1m: 14,
+  overdue_1m:    28,
+  overdue_2m:    45,
+  overdue_3m:    75,
+  overdue_older: 120,
+};
+const BUCKET_LABELS = {
+  current:       'Current',
+  overdue_lt_1m: '< 1 month',
+  overdue_1m:    '1 month',
+  overdue_2m:    '2 months',
+  overdue_3m:    '3 months',
+  overdue_older: 'Older',
+};
+const BUCKET_KEYS = ['current', 'overdue_lt_1m', 'overdue_1m', 'overdue_2m', 'overdue_3m', 'overdue_older'];
+
+// Compute the total outstanding for a debtor row (sum of all buckets).
+function debtorTotal(d) {
+  return BUCKET_KEYS.reduce((s, k) => s + (Number(d[k === 'current' ? 'current_amount' : k]) || 0), 0);
+}
+
+// Map bucket key to its column name on the debtor record (current is the odd one out)
+function bucketCol(key) {
+  return key === 'current' ? 'current_amount' : key;
+}
+
+// Generate predicted cash events for a debtor — one per non-zero bucket.
+// If payment_date_override is set, returns ONE event for the total on that date instead.
+function debtorCashEvents(d) {
+  const events = [];
+  const total = debtorTotal(d);
+  if (total === 0 || d.status !== 'outstanding') return events;
+
+  // Override: single event for the full outstanding
+  if (d.payment_date_override) {
+    events.push({
+      date: d.payment_date_override,
+      gross: total,
+      label: `${d.contact_name} — full balance (override)`,
+      source: 'debtor',
+      bucket: 'override',
+      debtor: d,
+    });
+    return events;
+  }
+
+  // Otherwise one event per non-zero bucket
+  const snap = d.snapshot_date || new Date().toISOString().slice(0, 10);
+  for (const key of BUCKET_KEYS) {
+    const amount = Number(d[bucketCol(key)]) || 0;
+    if (amount === 0) continue;
+    const date = addDays(snap, BUCKET_OFFSET_DAYS[key]);
+    events.push({
+      date,
+      gross: amount,
+      label: `${d.contact_name} — ${BUCKET_LABELS[key]}`,
+      source: 'debtor',
+      bucket: key,
+      debtor: d,
+    });
+  }
+  return events;
+}
+
+function DebtorsPage({ access }) {
+  const [debtors, setDebtors] = useState(null);
+  const [projects, setProjects] = useState(null);
+  const [batches, setBatches] = useState(null);
+  const [error, setError] = useState(null);
+  const [showImport, setShowImport] = useState(false);
+  const [editDebtor, setEditDebtor] = useState(null);
+  const [showCleared, setShowCleared] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      const [d, p, b] = await Promise.all([
+        sbSelect('debtors', 'select=*&order=contact_name.asc', access.session),
+        sbSelect('projects',
+          'select=id,name,status&status=in.(active,complete)&order=name.asc',
+          access.session),
+        sbSelect('csv_import_batches', 'select=*&order=created_at.desc&limit=10', access.session),
+      ]);
+      setDebtors(d || []);
+      setProjects(p || []);
+      setBatches(b || []);
+    } catch (e) { setError(e.message); }
+  }, [access.session]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (debtors === null) return <LoadingMsg label="Loading debtors…" />;
+
+  const outstanding = debtors.filter(d => d.status === 'outstanding');
+  const cleared = debtors.filter(d => d.status === 'cleared');
+  const unmatched = outstanding.filter(d => !d.project_id);
+  const totalOutstanding = outstanding.reduce((s, d) => s + debtorTotal(d), 0);
+
+  const latestBatch = batches && batches[0];
+
+  return (
+    <div style={{ maxWidth: 1400 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, marginBottom: 20 }}>
+        <div>
+          <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Debtors</h1>
+          <div style={{ fontSize: 13, color: C.muted }}>
+            {outstanding.length} outstanding · £{fmtMoney(totalOutstanding)}
+            {latestBatch && (
+              <span> · last imported {timeAgo(latestBatch.created_at)} from {latestBatch.filename || 'file'}</span>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button onClick={() => setShowImport(true)} style={btn(false)}>
+            ↑ Import aged receivables
+          </button>
+        </div>
+      </div>
+
+      {unmatched.length > 0 && (
+        <div style={{
+          background: C.amberLight, color: C.text, padding: '12px 16px', borderRadius: 6,
+          borderLeft: `3px solid ${C.amber}`, marginBottom: 20, fontSize: 13,
+        }}>
+          <strong style={{ color: C.amber }}>⚠ {unmatched.length} debtor{unmatched.length === 1 ? '' : 's'} unmatched</strong>
+          <div style={{ marginTop: 4, color: C.muted, fontSize: 12 }}>
+            These contacts don't match any active or completed project. Click a row to link manually,
+            or rename projects/contacts so they match. Unmatched debtors still appear on the master
+            cashflow grid under the "Other debtors" row.
+          </div>
+        </div>
+      )}
+
+      <DebtorTable
+        rows={outstanding}
+        projects={projects}
+        title="Outstanding"
+        onRowClick={setEditDebtor}
+        showProjectColumn
+      />
+
+      {cleared.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <button
+            onClick={() => setShowCleared(o => !o)}
+            style={{
+              background: C.white, border: `1px solid ${C.line}`, borderRadius: 8,
+              padding: '12px 16px', width: '100%', textAlign: 'left',
+              cursor: 'pointer', fontSize: 13, fontWeight: 600, color: C.text,
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              fontFamily: 'inherit',
+            }}
+          >
+            <span>{showCleared ? '▾' : '▸'} Cleared debtors ({cleared.length})</span>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 500 }}>
+              {showCleared ? 'Hide' : 'Show'}
+            </span>
+          </button>
+          {showCleared && (
+            <div style={{ marginTop: 12 }}>
+              <DebtorTable
+                rows={cleared}
+                projects={projects}
+                title=""
+                onRowClick={setEditDebtor}
+                showProjectColumn
+                isCleared
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {showImport && (
+        <DebtorImportModal
+          access={access}
+          projects={projects}
+          existingDebtors={debtors}
+          onClose={() => setShowImport(false)}
+          onComplete={() => { setShowImport(false); reload(); }}
+        />
+      )}
+
+      {editDebtor && (
+        <DebtorEditModal
+          debtor={editDebtor}
+          projects={projects}
+          access={access}
+          onClose={() => setEditDebtor(null)}
+          onSaved={() => { setEditDebtor(null); reload(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// DEBTOR TABLE — used both for outstanding and cleared sections
+// ============================================================
+function DebtorTable({ rows, projects, title, onRowClick, showProjectColumn, isCleared }) {
+  if (rows.length === 0) {
+    return (
+      <SectionBox title={title || 'Debtors'}>
+        <div style={{ padding: 30, textAlign: 'center', color: C.muted, fontSize: 13 }}>
+          No debtors yet. Click "Import aged receivables" to add some.
+        </div>
+      </SectionBox>
+    );
+  }
+
+  // Grid: contact | total | current | <1m | 1m | 2m | 3m | older | project | actions
+  // Bucket columns are narrow; the total column is the prominent figure.
+  const gridCols = '1.8fr 1fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.4fr 32px';
+
+  const HeaderCell = ({ children, align }) => (
+    <div style={{
+      fontSize: 11, color: C.muted, fontWeight: 700,
+      textTransform: 'uppercase', letterSpacing: '0.04em',
+      textAlign: align || 'left', padding: '0 6px',
+    }}>{children}</div>
+  );
+
+  return (
+    <SectionBox title={title}>
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ minWidth: 980 }}>
+          {/* Header row */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: gridCols, gap: 4,
+            padding: '8px 0', borderBottom: `2px solid ${C.line}`,
+          }}>
+            <HeaderCell>Contact</HeaderCell>
+            <HeaderCell align="right">Total £</HeaderCell>
+            <HeaderCell align="right">Current</HeaderCell>
+            <HeaderCell align="right">{'<'} 1m</HeaderCell>
+            <HeaderCell align="right">1m</HeaderCell>
+            <HeaderCell align="right">2m</HeaderCell>
+            <HeaderCell align="right">3m</HeaderCell>
+            <HeaderCell align="right">Older</HeaderCell>
+            <HeaderCell>Project</HeaderCell>
+            <HeaderCell></HeaderCell>
+          </div>
+          {/* Body */}
+          {rows.map(d => {
+            const total = debtorTotal(d);
+            const project = projects && d.project_id ? projects.find(p => p.id === d.project_id) : null;
+            const unmatched = !d.project_id && !isCleared;
+            return (
+              <div
+                key={d.id}
+                onClick={() => onRowClick(d)}
+                style={{
+                  display: 'grid', gridTemplateColumns: gridCols, gap: 4,
+                  padding: '10px 0', borderBottom: `1px solid ${C.line}`,
+                  alignItems: 'center', cursor: 'pointer',
+                  background: unmatched ? C.amberLight : 'transparent',
+                  opacity: isCleared ? 0.6 : 1,
+                  transition: 'background 0.1s',
+                }}
+                onMouseEnter={(e) => { if (!unmatched) e.currentTarget.style.background = C.bg; }}
+                onMouseLeave={(e) => { if (!unmatched) e.currentTarget.style.background = 'transparent'; }}
+              >
+                <div style={{ padding: '0 6px', fontSize: 13, fontWeight: 600, color: C.text }}>
+                  {d.contact_name}
+                  {d.source === 'manual' && (
+                    <span style={{ fontSize: 10, color: C.muted, marginLeft: 6, fontStyle: 'italic' }}>(manual)</span>
+                  )}
+                  {d.payment_date_override && (
+                    <div style={{ fontSize: 10, color: C.prussian, marginTop: 2 }}>
+                      Override: {fmtDateShort(d.payment_date_override)}
+                    </div>
+                  )}
+                  {d.notes && (
+                    <div style={{ fontSize: 10, color: C.muted, marginTop: 2, fontStyle: 'italic' }}>
+                      {d.notes.length > 60 ? d.notes.slice(0, 60) + '…' : d.notes}
+                    </div>
+                  )}
+                </div>
+                <BucketCell value={total} bold align="right" />
+                <BucketCell value={d.current_amount} />
+                <BucketCell value={d.overdue_lt_1m} />
+                <BucketCell value={d.overdue_1m} />
+                <BucketCell value={d.overdue_2m} amberThreshold />
+                <BucketCell value={d.overdue_3m} redThreshold />
+                <BucketCell value={d.overdue_older} redThreshold />
+                <div style={{ padding: '0 6px', fontSize: 12 }}>
+                  {project ? (
+                    <span style={{
+                      background: C.prussianLight, color: C.prussian,
+                      padding: '3px 10px', borderRadius: 10, fontWeight: 600,
+                    }}>{project.name}</span>
+                  ) : isCleared ? (
+                    <span style={{ color: C.muted, fontStyle: 'italic', fontSize: 11 }}>—</span>
+                  ) : (
+                    <span style={{
+                      color: C.amber, fontStyle: 'italic', fontWeight: 600,
+                      fontSize: 11,
+                    }}>⚠ Unmatched — click to link</span>
+                  )}
+                </div>
+                <div style={{ textAlign: 'center', color: C.muted, fontSize: 14 }}>›</div>
+              </div>
+            );
+          })}
+          {/* Total row */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: gridCols, gap: 4,
+            padding: '12px 0 8px', background: C.redSoft,
+            borderTop: `2px solid ${C.line}`,
+          }}>
+            <div style={{ padding: '0 6px', fontSize: 13, fontWeight: 700, color: C.red }}>Total</div>
+            <BucketCell value={rows.reduce((s, d) => s + debtorTotal(d), 0)} bold align="right" />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.current_amount) || 0), 0)} bold />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.overdue_lt_1m) || 0), 0)} bold />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.overdue_1m) || 0), 0)} bold />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.overdue_2m) || 0), 0)} bold />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.overdue_3m) || 0), 0)} bold />
+            <BucketCell value={rows.reduce((s, d) => s + (Number(d.overdue_older) || 0), 0)} bold />
+            <div></div>
+            <div></div>
+          </div>
+        </div>
+      </div>
+    </SectionBox>
+  );
+}
+
+function BucketCell({ value, bold, align, amberThreshold, redThreshold }) {
+  const n = Number(value) || 0;
+  const display = n === 0 ? '—' : `£${fmtMoney(n)}`;
+  let color = C.text;
+  if (n === 0) color = C.line;
+  else if (n < 0) color = C.redStatus;
+  else if (redThreshold && n > 0) color = C.redStatus;
+  else if (amberThreshold && n > 0) color = C.amber;
+  return (
+    <div style={{
+      padding: '0 6px', textAlign: align || 'right',
+      fontSize: 12, color, fontWeight: bold ? 700 : 500,
+      fontVariantNumeric: 'tabular-nums',
+    }}>{display}</div>
+  );
+}
+
+// ============================================================
+// DEBTOR EDIT MODAL — link to project, payment override, notes, manual clear
+// ============================================================
+function DebtorEditModal({ debtor, projects, access, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    project_id: debtor.project_id || '',
+    payment_date_override: debtor.payment_date_override || '',
+    notes: debtor.notes || '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const isCleared = debtor.status === 'cleared';
+  const total = debtorTotal(debtor);
+
+  const save = async () => {
+    setBusy(true); setError('');
+    try {
+      await sbUpdate('debtors', `id=eq.${debtor.id}`, {
+        project_id: form.project_id || null,
+        payment_date_override: form.payment_date_override || null,
+        notes: form.notes.trim() || null,
+      }, access.session);
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  const manuallyClear = async () => {
+    if (!window.confirm(`Mark ${debtor.contact_name} as cleared? They'll be hidden from the cashflow grid but kept for audit.`)) return;
+    setBusy(true); setError('');
+    try {
+      await sbUpdate('debtors', `id=eq.${debtor.id}`, {
+        status: 'cleared',
+        cleared_at: new Date().toISOString(),
+        cleared_reason: 'Manually cleared by ' + getEmail(access.session),
+      }, access.session);
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  const reactivate = async () => {
+    setBusy(true); setError('');
+    try {
+      await sbUpdate('debtors', `id=eq.${debtor.id}`, {
+        status: 'outstanding',
+        cleared_at: null,
+        cleared_reason: null,
+      }, access.session);
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 580 }}>
+        <h2 style={{ fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif', color: C.red, marginTop: 0, marginBottom: 6, fontWeight: 700, fontSize: 22 }}>
+          {debtor.contact_name}
+        </h2>
+        <div style={{ fontSize: 13, color: C.muted, marginBottom: 18 }}>
+          £{fmtMoney(total)} outstanding · snapshot {fmtDateShort(debtor.snapshot_date)} ·
+          {isCleared ? <span style={{ color: C.muted, fontStyle: 'italic' }}> cleared {timeAgo(debtor.cleared_at)}</span> : <span> {debtor.source}</span>}
+        </div>
+
+        {/* Bucket breakdown — read-only summary */}
+        <div style={{ background: C.bg, padding: 12, borderRadius: 6, marginBottom: 18 }}>
+          <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+            Ageing breakdown
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 8 }}>
+            {BUCKET_KEYS.map(key => {
+              const val = Number(debtor[bucketCol(key)]) || 0;
+              return (
+                <div key={key}>
+                  <div style={{ fontSize: 10, color: C.muted, fontWeight: 500 }}>{BUCKET_LABELS[key]}</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: val === 0 ? C.line : (val < 0 ? C.redStatus : C.text), fontVariantNumeric: 'tabular-nums' }}>
+                    {val === 0 ? '—' : `£${fmtMoney(val)}`}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <Field label="Linked project">
+          <select
+            value={form.project_id}
+            onChange={(e) => setForm({ ...form, project_id: e.target.value })}
+            style={inp(isCleared)}
+            disabled={isCleared}
+          >
+            <option value="">— Unmatched (appears under 'Other debtors') —</option>
+            {(projects || []).map(p => (
+              <option key={p.id} value={p.id}>
+                {p.name} {p.status === 'complete' ? '(complete)' : ''}
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        <Field label="Payment date override (optional)">
+          <DateField
+            value={form.payment_date_override}
+            onChange={(v) => setForm({ ...form, payment_date_override: v })}
+            disabled={isCleared}
+          />
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>
+            If set, the full outstanding balance is predicted to land on this date.
+            Otherwise the bucket-to-date heuristic is used.
+          </div>
+        </Field>
+
+        <Field label="Notes">
+          <textarea
+            value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+            style={{ ...inp(isCleared), minHeight: 60, fontFamily: 'inherit', resize: 'vertical' }}
+            disabled={isCleared}
+            placeholder="Optional — e.g. agreed payment plan, dispute notes…"
+          />
+        </Field>
+
+        {error && (
+          <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
+          {isCleared ? (
+            <button onClick={reactivate} disabled={busy} style={btnGhost()}>
+              Reactivate
+            </button>
+          ) : (
+            <button onClick={manuallyClear} disabled={busy} style={{ ...btnGhost(), color: C.redStatus, borderColor: C.redStatus }}>
+              Mark as cleared
+            </button>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} disabled={busy} style={btnGhost()}>Cancel</button>
+            {!isCleared && (
+              <button onClick={save} disabled={busy} style={btn(busy)}>
+                {busy ? 'Saving…' : 'Save'}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// DEBTOR IMPORT MODAL — multi-step wizard
+//   1. File picker
+//   2. Parse + preview (auto-detects Xero aged-receivables format)
+//   3. Match contacts to projects (auto-exact, manual for the rest)
+//   4. Confirm + commit
+// ============================================================
+function DebtorImportModal({ access, projects, existingDebtors, onClose, onComplete }) {
+  const [step, setStep] = useState(1);
+  const [filename, setFilename] = useState('');
+  const [parsed, setParsed] = useState(null); // { snapshotDate, rows: [{ contact, buckets, total }] }
+  const [parseError, setParseError] = useState('');
+  const [matches, setMatches] = useState({}); // contact_name -> project_id ('' = unmatched)
+  const [busy, setBusy] = useState(false);
+  const [commitError, setCommitError] = useState('');
+  const fileInputRef = useRef(null);
+
+  const handleFileChosen = async (file) => {
+    if (!file) return;
+    setFilename(file.name);
+    setParseError('');
+    setBusy(true);
+    try {
+      const data = await file.arrayBuffer();
+      const result = parseAgedReceivablesXlsx(data);
+      setParsed(result);
+      // Auto-match contacts to projects by exact case-insensitive name match
+      const initMatches = {};
+      for (const row of result.rows) {
+        const norm = row.contact.trim().toLowerCase();
+        const match = (projects || []).find(p => p.name.trim().toLowerCase() === norm);
+        initMatches[row.contact] = match ? match.id : '';
+      }
+      setMatches(initMatches);
+      setStep(2);
+    } catch (e) {
+      setParseError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  const commit = async () => {
+    setBusy(true); setCommitError('');
+    try {
+      // 1. Create the batch record
+      const batch = await sbInsert('csv_import_batches', {
+        created_by_email: getEmail(access.session),
+        filename,
+        snapshot_date: parsed.snapshotDate,
+        row_count: parsed.rows.length,
+        total_outstanding: parsed.rows.reduce((s, r) => s + r.total, 0),
+        rows_inserted: 0, rows_updated: 0, rows_cleared: 0,
+      }, access.session);
+      const batchId = batch[0].id;
+
+      // 2. Walk through parsed rows. Match against existing outstanding debtors
+      //    by case-insensitive contact name. Insert new; update existing; track stats.
+      const existingByName = new Map();
+      for (const d of existingDebtors) {
+        if (d.status === 'outstanding') {
+          existingByName.set(d.contact_name.trim().toLowerCase(), d);
+        }
+      }
+
+      let inserted = 0, updated = 0;
+      const seenNames = new Set();
+
+      for (const row of parsed.rows) {
+        const key = row.contact.trim().toLowerCase();
+        seenNames.add(key);
+        const existing = existingByName.get(key);
+        const projectId = matches[row.contact] || null;
+        const payload = {
+          contact_name: row.contact,
+          project_id: projectId,
+          current_amount: row.buckets.current,
+          overdue_lt_1m: row.buckets.overdue_lt_1m,
+          overdue_1m: row.buckets.overdue_1m,
+          overdue_2m: row.buckets.overdue_2m,
+          overdue_3m: row.buckets.overdue_3m,
+          overdue_older: row.buckets.overdue_older,
+          snapshot_date: parsed.snapshotDate,
+          import_batch_id: batchId,
+          source: 'imported',
+          status: 'outstanding',
+        };
+        if (existing) {
+          // Preserve user overrides on update — only refresh bucket values + snapshot.
+          // Don't overwrite project_id if user has already set one and the matcher
+          // didn't find a project (we still send the user's existing project_id).
+          // payment_date_override and notes are NEVER touched by import.
+          const updatePayload = { ...payload };
+          if (!projectId && existing.project_id) {
+            updatePayload.project_id = existing.project_id;
+          }
+          delete updatePayload.created_by_email;
+          await sbUpdate('debtors', `id=eq.${existing.id}`, updatePayload, access.session);
+          updated++;
+        } else {
+          payload.created_by_email = getEmail(access.session);
+          await sbInsert('debtors', payload, access.session);
+          inserted++;
+        }
+      }
+
+      // 3. Soft-clear any outstanding debtors that didn't appear in this import
+      let cleared = 0;
+      for (const [name, d] of existingByName) {
+        if (!seenNames.has(name)) {
+          await sbUpdate('debtors', `id=eq.${d.id}`, {
+            status: 'cleared',
+            cleared_at: new Date().toISOString(),
+            cleared_reason: `Auto-cleared on import of ${filename} (no longer in aged receivables)`,
+          }, access.session);
+          cleared++;
+        }
+      }
+
+      // 4. Update the batch stats
+      await sbUpdate('csv_import_batches', `id=eq.${batchId}`, {
+        rows_inserted: inserted, rows_updated: updated, rows_cleared: cleared,
+      }, access.session);
+
+      onComplete();
+    } catch (e) {
+      setCommitError(e.message);
+      setBusy(false);
+    }
+  };
+
+  // Step 1 — file picker
+  if (step === 1) {
+    return (
+      <div className="arke-modal-backdrop" onClick={onClose}>
+        <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 540 }}>
+          <h2 style={{ fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif', color: C.red, marginTop: 0, fontWeight: 700, fontSize: 22 }}>
+            Import aged receivables
+          </h2>
+          <p style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
+            Upload your Xero "Aged Receivables Summary" export (.xlsx or .csv). The file should
+            have a Contact column and ageing buckets: Current, &lt; 1 Month, 1 Month, 2 Months,
+            3 Months, Older.
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={(e) => handleFileChosen(e.target.files[0])}
+            style={{ display: 'none' }}
+          />
+          <button
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            disabled={busy}
+            style={{
+              ...btnGhost(), width: '100%', padding: 30, fontSize: 14,
+              borderStyle: 'dashed', borderWidth: 2,
+            }}
+          >
+            {busy ? 'Parsing…' : '📁 Choose file…'}
+          </button>
+          {parseError && (
+            <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+              {parseError}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 18 }}>
+            <button onClick={onClose} style={btnGhost()}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Step 2 — preview + match
+  const matchedCount = Object.values(matches).filter(v => v).length;
+  const unmatchedCount = parsed.rows.length - matchedCount;
+  const grandTotal = parsed.rows.reduce((s, r) => s + r.total, 0);
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 920 }}>
+        <h2 style={{ fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif', color: C.red, marginTop: 0, fontWeight: 700, fontSize: 22 }}>
+          Review import — {filename}
+        </h2>
+        <div style={{ display: 'flex', gap: 20, marginBottom: 18, fontSize: 13, color: C.muted, flexWrap: 'wrap' }}>
+          <span>📅 Snapshot date: <strong style={{ color: C.text }}>{fmtDateShort(parsed.snapshotDate)}</strong></span>
+          <span>👥 {parsed.rows.length} contacts</span>
+          <span>£ {fmtMoney(grandTotal)} outstanding</span>
+        </div>
+
+        <div style={{
+          padding: '10px 14px',
+          background: unmatchedCount > 0 ? C.amberLight : C.greenLight,
+          borderLeft: `3px solid ${unmatchedCount > 0 ? C.amber : C.green}`,
+          borderRadius: 6, marginBottom: 14, fontSize: 13,
+        }}>
+          <strong style={{ color: unmatchedCount > 0 ? C.amber : C.green }}>
+            {matchedCount} auto-matched · {unmatchedCount} unmatched
+          </strong>
+          {unmatchedCount > 0 && (
+            <div style={{ marginTop: 4, color: C.muted, fontSize: 12 }}>
+              Pick a project for each unmatched contact below, or leave as "Unmatched" if
+              they're not project-related (insurance refunds, ad-hoc clients, etc.).
+            </div>
+          )}
+        </div>
+
+        <div style={{ maxHeight: '50vh', overflowY: 'auto', border: `1px solid ${C.line}`, borderRadius: 6 }}>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1.6fr 0.9fr 1.5fr',
+            padding: '8px 10px', background: C.bg,
+            fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
+            borderBottom: `1px solid ${C.line}`, position: 'sticky', top: 0,
+          }}>
+            <div>Contact</div>
+            <div style={{ textAlign: 'right' }}>Total £</div>
+            <div>Linked project</div>
+          </div>
+          {parsed.rows.map((r, i) => {
+            const isMatched = !!matches[r.contact];
+            return (
+              <div key={i} style={{
+                display: 'grid', gridTemplateColumns: '1.6fr 0.9fr 1.5fr',
+                padding: '8px 10px', borderBottom: i === parsed.rows.length - 1 ? 'none' : `1px solid ${C.line}`,
+                alignItems: 'center',
+                background: isMatched ? 'transparent' : C.amberLight,
+              }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{r.contact}</div>
+                <div style={{ fontSize: 13, fontVariantNumeric: 'tabular-nums', textAlign: 'right' }}>
+                  £{fmtMoney(r.total)}
+                </div>
+                <select
+                  value={matches[r.contact] || ''}
+                  onChange={(e) => setMatches({ ...matches, [r.contact]: e.target.value })}
+                  style={{ ...inp(), padding: '4px 6px', fontSize: 12 }}
+                >
+                  <option value="">⚠ Unmatched (other debtor)</option>
+                  {(projects || []).map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} {p.status === 'complete' ? '(complete)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          })}
+        </div>
+
+        {commitError && (
+          <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 14, borderLeft: `3px solid ${C.redStatus}` }}>
+            {commitError}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
+          <div style={{ fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
+            Existing contacts not in this file will be marked as cleared.
+            Payment date overrides and notes are preserved on update.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} disabled={busy} style={btnGhost()}>Cancel</button>
+            <button onClick={commit} disabled={busy} style={btn(busy)}>
+              {busy ? 'Importing…' : `Import ${parsed.rows.length} debtors`}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// XERO AGED RECEIVABLES PARSER
+// Parses a Xero "Aged Receivables Summary" .xlsx file into a normalised shape.
+// Format (per the supplied sample):
+//   Row 0-1: blank
+//   Row 2 col 0: "As at <date>"
+//   Row 3 col 0: "Ageing by due date"
+//   Row 4: blank
+//   Row 5: column headers — "Contact", "Current", "< 1 Month", "1 Month", "2 Months", "3 Months", "Older", "Total"
+//   Row 6 onwards: data rows
+//   Last data rows: a "Total" row and a "Percentage of total" row (both skipped)
+//
+// Returns { snapshotDate (ISO), rows: [{ contact, buckets: {current, overdue_lt_1m, …}, total }] }
+// ============================================================
+function parseAgedReceivablesXlsx(arrayBuffer) {
+  if (typeof XLSX === 'undefined') {
+    throw new Error('XLSX library not loaded. Refresh the page and try again.');
+  }
+  const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  if (!wb.SheetNames || wb.SheetNames.length === 0) throw new Error('File has no sheets.');
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+
+  if (rows.length === 0) throw new Error('Sheet is empty.');
+
+  // Find the snapshot date in the first ~6 rows. Expected format: "As at 21 May 2026"
+  let snapshotDate = null;
+  for (let i = 0; i < Math.min(rows.length, 6); i++) {
+    for (const cell of rows[i]) {
+      if (typeof cell === 'string' && /as at/i.test(cell)) {
+        const m = cell.match(/as at\s+(.+)/i);
+        if (m) {
+          const parsed = parseFlexibleDate(m[1].trim());
+          if (parsed) { snapshotDate = parsed; break; }
+        }
+      }
+    }
+    if (snapshotDate) break;
+  }
+  if (!snapshotDate) {
+    // Fallback to today
+    snapshotDate = new Date().toISOString().slice(0, 10);
+  }
+
+  // Find the header row containing "Contact"
+  let headerRowIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.some(c => typeof c === 'string' && c.trim().toLowerCase() === 'contact')) {
+      headerRowIdx = i; break;
+    }
+  }
+  if (headerRowIdx === -1) {
+    throw new Error('Could not find a "Contact" header row. Make sure this is a Xero Aged Receivables Summary export.');
+  }
+
+  // Map header → column index
+  const headers = rows[headerRowIdx].map(h => typeof h === 'string' ? h.trim().toLowerCase() : '');
+  const colIdx = {};
+  for (let c = 0; c < headers.length; c++) {
+    const h = headers[c];
+    if (h === 'contact') colIdx.contact = c;
+    else if (h === 'current') colIdx.current = c;
+    else if (h === '< 1 month' || h === '<1 month' || h === 'less than 1 month') colIdx.overdue_lt_1m = c;
+    else if (h === '1 month') colIdx.overdue_1m = c;
+    else if (h === '2 months') colIdx.overdue_2m = c;
+    else if (h === '3 months') colIdx.overdue_3m = c;
+    else if (h === 'older') colIdx.overdue_older = c;
+    else if (h === 'total') colIdx.total = c;
+  }
+  // Sanity check
+  for (const required of ['contact', 'current', 'total']) {
+    if (colIdx[required] === undefined) {
+      throw new Error(`Missing required column "${required}" in header row. Found: ${headers.filter(Boolean).join(', ')}`);
+    }
+  }
+
+  // Parse data rows
+  const result = [];
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    const contactRaw = row[colIdx.contact];
+    if (contactRaw === null || contactRaw === undefined) continue;
+    const contact = String(contactRaw).trim();
+    if (!contact) continue;
+    // Skip totals and percentage rows
+    if (/^total$/i.test(contact) || /percentage of total/i.test(contact)) continue;
+
+    const buckets = {
+      current:       num(row[colIdx.current]),
+      overdue_lt_1m: num(row[colIdx.overdue_lt_1m]),
+      overdue_1m:    num(row[colIdx.overdue_1m]),
+      overdue_2m:    num(row[colIdx.overdue_2m]),
+      overdue_3m:    num(row[colIdx.overdue_3m]),
+      overdue_older: num(row[colIdx.overdue_older]),
+    };
+    const total = num(row[colIdx.total]);
+    // Skip all-zero rows (occasionally Xero emits a phantom empty row)
+    if (total === 0 && Object.values(buckets).every(v => v === 0)) continue;
+    result.push({ contact, buckets, total });
+  }
+
+  if (result.length === 0) {
+    throw new Error('No data rows found between the header and the totals row.');
+  }
+
+  return { snapshotDate, rows: result };
+
+  function num(v) {
+    if (v === null || v === undefined || v === '') return 0;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') {
+      const cleaned = v.replace(/[,£\s]/g, '').replace(/\(/g, '-').replace(/\)/g, '');
+      const n = Number(cleaned);
+      return isNaN(n) ? 0 : n;
+    }
+    return 0;
+  }
+}
+
+// Try to parse a date in various plain-English formats, returning an ISO yyyy-mm-dd string.
+function parseFlexibleDate(s) {
+  // Browser Date constructor handles a lot — "21 May 2026" works in modern engines
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return d.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
 function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
 
 // ============================================================
