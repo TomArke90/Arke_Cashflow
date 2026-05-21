@@ -1314,27 +1314,29 @@ function CashflowPage({ access }) {
   };
 
   // Export handlers
-  const exportRows = () => {
-    // Determine which week columns to include. When hideEmptyExportCols is on,
-    // drop any week where the weekTotal is zero — this keeps the export
-    // compact and analytical (avoids walls of empty cells).
+  // ============================================================
+  // EXPORTS — view-aware. Each builder returns:
+  //   { title, rows, colWidths, viewTag }
+  // where rows[0] is the header. Whichever view is active drives the choice
+  // of builder.
+  // ============================================================
+
+  // Builder for the future-forecast weekly grid (the old export logic, lifted).
+  const buildForecastExport = () => {
     const cols = hideEmptyExportCols
       ? weekColumns.filter(wk => (grid.weekTotals[wk] || 0) !== 0)
       : weekColumns;
-    // Returns array-of-arrays for CSV/XLSX consumption
     const headerRow = ['Project', 'Status', ...cols.map(wk => `Wk of ${fmtDateShort(wk)}`), 'Total'];
     const rows = [headerRow];
     for (const p of qualifyingProjects) {
       const row = grid.perProject[p.id];
-      const cells = [
+      rows.push([
         p.name + (p.number ? ` (${p.number})` : ''),
         p.status,
         ...cols.map(wk => row.weeks[wk].total || 0),
         row.rowTotal,
-      ];
-      rows.push(cells);
+      ]);
     }
-    // Other debtors row (only if there are any)
     if (grid.unmatched.hasAny) {
       rows.push([
         'Other debtors', 'unmatched',
@@ -1342,7 +1344,6 @@ function CashflowPage({ access }) {
         grid.unmatched.rowTotal,
       ]);
     }
-    // Overhead category rows
     for (const ohRow of grid.overheadRows) {
       rows.push([
         ohRow.categoryName, 'overhead',
@@ -1350,43 +1351,118 @@ function CashflowPage({ access }) {
         ohRow.rowTotal,
       ]);
     }
-    // Totals
     rows.push([
       'Week total', '',
       ...cols.map(wk => grid.weekTotals[wk] || 0),
       grid.grandTotal,
     ]);
-    // Running balance — compute against the *filtered* columns. We need to
-    // recompute against the cols index (running balance must be cumulative
-    // from the opening balance even if some weeks are omitted).
-    const filteredRunningBalance = [];
+    // Running balance — recompute against full weekColumns so cumulative is
+    // accurate even when empty columns are hidden.
+    const balByWeek = {};
     {
-      const ob = Number(settings.opening_balance) || 0;
-      let bal = ob;
-      // Walk through the FULL weekColumns array to keep the running totals
-      // accurate, then pick out the values that correspond to kept columns.
-      const balByWeek = {};
-      for (const wk of weekColumns) {
-        bal += (grid.weekTotals[wk] || 0);
-        balByWeek[wk] = bal;
-      }
-      for (const wk of cols) filteredRunningBalance.push(balByWeek[wk]);
+      let bal = Number(settings.opening_balance) || 0;
+      for (const wk of weekColumns) { bal += (grid.weekTotals[wk] || 0); balByWeek[wk] = bal; }
     }
+    const finalBal = cols.length > 0 ? balByWeek[cols[cols.length - 1]] : (Number(settings.opening_balance) || 0);
     rows.push([
       `Running balance (from £${fmtMoney(settings.opening_balance)} on ${fmtDateShort(settings.opening_as_of_date)})`, '',
-      ...filteredRunningBalance,
-      filteredRunningBalance[filteredRunningBalance.length - 1] != null
-        ? filteredRunningBalance[filteredRunningBalance.length - 1]
-        : (Number(settings.opening_balance) || 0),
+      ...cols.map(wk => balByWeek[wk]),
+      finalBal,
     ]);
-    return { rows, colsCount: cols.length, totalCols: weekColumns.length };
+    return {
+      title: `Cashflow — Future forecast (${cols.length}w)`,
+      rows,
+      colWidths: [32, 10, ...Array.from({ length: cols.length }, () => 14), 14],
+      viewTag: 'forecast',
+    };
+  };
+
+  // Builder for the P&L view (weekly or monthly). Always emits the full
+  // exec-style layout: Opening / Money In + sub-rows / Money Out + sub-rows /
+  // Movement / Closing. Sub-rows are always exported regardless of whether
+  // they're currently expanded on screen — the export is a self-contained
+  // record, not a screenshot.
+  const buildPnLExport = () => {
+    if (!pnlGrid) return { title: 'P&L', rows: [['No data']], colWidths: [20], viewTag: 'pnl' };
+    const periodIds = pnlPeriods.map(p => p.id);
+    const periodLabels = pnlPeriods.map(p => p.label);
+    const header = ['Line', ...periodLabels, 'Total'];
+    const rowTotal = (getter) => periodIds.reduce((s, pid) => s + (Number(getter(pid)) || 0), 0);
+    const rows = [header];
+
+    // Opening: per-period openings (not summed — each is independent)
+    rows.push(['Opening', ...periodIds.map(pid => pnlGrid.opening[pid] || 0), '']);
+
+    // Money In total + sub-rows
+    rows.push([
+      'Money In',
+      ...periodIds.map(pid => pnlGrid.moneyInTotal[pid] || 0),
+      rowTotal(pid => pnlGrid.moneyInTotal[pid]),
+    ]);
+    rows.push([
+      '  Invoices',
+      ...periodIds.map(pid => pnlGrid.invoices[pid] || 0),
+      rowTotal(pid => pnlGrid.invoices[pid]),
+    ]);
+    rows.push([
+      '  Retention',
+      ...periodIds.map(pid => pnlGrid.retention[pid] || 0),
+      rowTotal(pid => pnlGrid.retention[pid]),
+    ]);
+    if (pnlGrid.hasOtherDebtors) {
+      rows.push([
+        '  Other debtors',
+        ...periodIds.map(pid => pnlGrid.otherDebtors[pid] || 0),
+        rowTotal(pid => pnlGrid.otherDebtors[pid]),
+      ]);
+    }
+
+    // Money Out total + per-category sub-rows
+    rows.push([
+      'Money Out',
+      ...periodIds.map(pid => pnlGrid.moneyOutTotal[pid] || 0),
+      rowTotal(pid => pnlGrid.moneyOutTotal[pid]),
+    ]);
+    for (const ohRow of pnlGrid.overheadRows) {
+      rows.push([
+        '  ' + ohRow.name,
+        ...periodIds.map(pid => ohRow.totals[pid] || 0),
+        rowTotal(pid => ohRow.totals[pid]),
+      ]);
+    }
+
+    // Movement + Closing
+    rows.push([
+      'Movement',
+      ...periodIds.map(pid => pnlGrid.movement[pid] || 0),
+      rowTotal(pid => pnlGrid.movement[pid]),
+    ]);
+    rows.push([
+      'Closing forecast',
+      ...periodIds.map(pid => pnlGrid.closing[pid] || 0),
+      '',
+    ]);
+
+    const periodLabel = pnlPeriod === 'monthly' ? `${periodIds.length}-month` : '3-week';
+    return {
+      title: `Cashflow — ${pnlPeriod === 'monthly' ? 'Monthly' : 'Weekly'} P&L (${periodLabel})`,
+      rows,
+      colWidths: [28, ...Array.from({ length: periodIds.length }, () => 14), 14],
+      viewTag: pnlPeriod === 'monthly' ? 'pnl-monthly' : 'pnl-weekly',
+    };
+  };
+
+  // Active builder picks based on current view
+  const buildActiveExport = () => {
+    if (pageView === 'pnl') return buildPnLExport();
+    return buildForecastExport();
   };
 
   const exportCsv = () => {
-    const { rows } = exportRows();
+    const { rows, viewTag } = buildActiveExport();
     const csv = rows.map(r =>
       r.map(cell => {
-        if (cell == null) return '';
+        if (cell == null || cell === '') return '';
         const s = typeof cell === 'number' ? cell.toFixed(2) : String(cell);
         if (s.includes(',') || s.includes('"') || s.includes('\n')) {
           return '"' + s.replace(/"/g, '""') + '"';
@@ -1394,7 +1470,7 @@ function CashflowPage({ access }) {
         return s;
       }).join(',')
     ).join('\n');
-    downloadBlob(csv, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv;charset=utf-8');
+    downloadBlob(csv, `arke-cashflow-${viewTag}-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv;charset=utf-8');
   };
 
   const exportXlsx = () => {
@@ -1402,17 +1478,117 @@ function CashflowPage({ access }) {
       alert('XLSX library not loaded. Try refreshing the page.');
       return;
     }
-    const { rows, colsCount } = exportRows();
+    const { rows, colWidths, viewTag } = buildActiveExport();
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [
-      { wch: 32 }, // project
-      { wch: 10 }, // status
-      ...Array.from({ length: colsCount }, () => ({ wch: 14 })),
-      { wch: 14 }, // total
-    ];
+    ws['!cols'] = colWidths.map(w => ({ wch: w }));
     XLSX.utils.book_append_sheet(wb, ws, 'Cashflow');
-    XLSX.writeFile(wb, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.xlsx`);
+    XLSX.writeFile(wb, `arke-cashflow-${viewTag}-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  // PDF export. We don't ship a heavyweight PDF library; instead open a popup
+  // with a printable HTML table and call window.print(). Every browser's print
+  // dialog has a "Save as PDF" destination — fast, lightweight, no extra deps.
+  const exportPdf = () => {
+    const { title, rows } = buildActiveExport();
+    const fmtCell = (v) => {
+      if (v === '' || v == null) return '';
+      if (typeof v === 'number') {
+        const sign = v < 0 ? '-' : '';
+        const abs = Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        return `${sign}£${abs}`;
+      }
+      return String(v);
+    };
+    const isNegativeCell = (v) => typeof v === 'number' && v < 0;
+    // First column is the label — render left-aligned. Other cells right-aligned numeric.
+    const isLabelRow = (cell) => typeof cell === 'string';
+    const generatedAt = new Date().toLocaleString('en-GB', {
+      day: 'numeric', month: 'long', year: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+    const htmlRows = rows.map((r, ri) => {
+      const isHeader = ri === 0;
+      const cells = r.map((cell, ci) => {
+        const isFirst = ci === 0;
+        const tag = isHeader ? 'th' : 'td';
+        const align = isFirst ? 'left' : 'right';
+        const neg = isNegativeCell(cell);
+        const styleParts = [`text-align:${align}`];
+        if (neg) styleParts.push('color:#C62828');
+        if (isHeader) styleParts.push('background:#FCF5F6;color:#8C002A;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;font-size:10px');
+        // Detect P&L "total" rows by their text content — bold them.
+        const label = isLabelRow(r[0]) ? r[0] : '';
+        const isTotalRow =
+          label === 'Opening' || label === 'Money In' || label === 'Money Out' ||
+          label === 'Movement' || label === 'Closing forecast' ||
+          label === 'Week total' || label.startsWith('Running balance');
+        if (isTotalRow && !isHeader) styleParts.push('font-weight:700');
+        // Indent sub-rows (start with two spaces in our exporter)
+        if (isFirst && typeof cell === 'string' && cell.startsWith('  ')) {
+          styleParts.push('padding-left:24px');
+        }
+        const style = styleParts.join(';');
+        return `<${tag} style="${style}">${fmtCell(cell)}</${tag}>`;
+      }).join('');
+      return `<tr>${cells}</tr>`;
+    }).join('\n');
+
+    const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif;
+    color: #2A2A2A; margin: 32px; font-size: 11px;
+  }
+  h1 { font-size: 22px; color: #8C002A; margin: 0 0 4px; font-weight: 700; letter-spacing: -0.01em; }
+  .subtitle { color: #6B6B6B; font-size: 11px; margin-bottom: 18px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    padding: 6px 10px; border-bottom: 1px solid #E5E0E2;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  tbody tr:nth-child(even) td { background: #FAF7F8; }
+  .footer { margin-top: 20px; font-size: 9px; color: #6B6B6B; }
+  @page { size: landscape; margin: 12mm; }
+  @media print {
+    body { margin: 0; }
+    .no-print { display: none !important; }
+  }
+  .print-btn {
+    position: fixed; top: 16px; right: 16px;
+    background: #8C002A; color: #fff; border: none; border-radius: 6px;
+    padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+</style>
+</head>
+<body>
+  <button class="print-btn no-print" onclick="window.print()">↓ Save as PDF</button>
+  <h1>${title}</h1>
+  <div class="subtitle">Arke Cashflow Hub · generated ${generatedAt}</div>
+  <table>
+    ${htmlRows}
+  </table>
+  <div class="footer">
+    Opening balance: £${fmtMoney(settings.opening_balance)} on ${fmtDateShort(settings.opening_as_of_date)}
+  </div>
+  <script>
+    // Auto-launch print dialog so user gets to "Save as PDF" without an extra click.
+    // Small delay lets the layout settle.
+    setTimeout(() => window.print(), 200);
+  ${'<'}/script>
+</body></html>`;
+
+    const w = window.open('', '_blank');
+    if (!w) {
+      alert('Could not open the print window — please allow pop-ups for this site.');
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
   };
 
   // Zoom-aware layout.
@@ -1609,21 +1785,26 @@ function CashflowPage({ access }) {
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end' }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 12, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginRight: 2 }}>Export:</span>
+            <span style={{ fontSize: 12, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginRight: 2 }}>
+              Export {pageView === 'pnl' ? (pnlPeriod === 'monthly' ? 'Monthly P&L' : 'Weekly P&L') : 'forecast'}:
+            </span>
             <button onClick={exportCsv} style={btnGhost()} title="Download as CSV">↓ CSV</button>
             <button onClick={exportXlsx} style={btnGhost()} title="Download as Excel">↓ XLSX</button>
+            <button onClick={exportPdf} style={btnGhost()} title="Print to PDF (uses your browser's Save as PDF)">↓ PDF</button>
           </div>
-          <label style={{
-            display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, cursor: 'pointer',
-          }}>
-            <input
-              type="checkbox"
-              checked={hideEmptyExportCols}
-              onChange={(e) => setHideEmptyExportCols(e.target.checked)}
-              style={{ margin: 0 }}
-            />
-            Hide empty weeks from exports
-          </label>
+          {pageView === 'forecast' && (
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={hideEmptyExportCols}
+                onChange={(e) => setHideEmptyExportCols(e.target.checked)}
+                style={{ margin: 0 }}
+              />
+              Hide empty weeks from exports
+            </label>
+          )}
         </div>
       </div>
 
