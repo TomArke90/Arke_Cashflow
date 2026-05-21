@@ -1019,7 +1019,8 @@ function CashflowPage({ access }) {
   // No abbreviations — pounds and pence are visible at every zoom level.
   const zoomConfig =
     windowWeeks <= 13 ? {
-      projectCol: 220, totalCol: 110, weekMin: 80,
+      // Calibrated to fit ~1285px wide: 200 + 13×75 + 110 = 1285.
+      projectCol: 200, totalCol: 110, weekMin: 75,
       rotated: false, rowHeight: null, fontSize: 12,
     } :
     windowWeeks <= 26 ? {
