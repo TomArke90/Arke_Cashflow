@@ -12,14 +12,29 @@
   body { font-family: "Century Gothic", "Avenir Next", Avenir, "URW Gothic", "Trebuchet MS", system-ui, sans-serif; background: #FAF7F8; color: #2A2A2A; }
   #root { min-height: 100vh; }
   input:focus, textarea:focus, select:focus, button:focus { outline: 2px solid #8C002A; outline-offset: -1px; }
-  /* Splash */
+  /* Splash — matches the carmine login screen aesthetic */
   .arke-splash {
-    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-    background: #FAF7F8; z-index: 9999; transition: opacity 0.3s ease;
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: #8C002A; z-index: 9999; transition: opacity 0.3s ease;
   }
   .arke-splash.hide { opacity: 0; pointer-events: none; }
-  .arke-splash-mark { font-family: "Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif; font-size: 36px; color: #8C002A; font-weight: 400; letter-spacing: -0.01em; }
-  .arke-splash-text { color: #6B6B6B; font-size: 13px; margin-top: 8px; text-align: center; }
+  .arke-splash-mark {
+    font-family: "Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif;
+    font-size: 64px; color: #FFFFFF; font-weight: 400;
+    letter-spacing: -0.02em; line-height: 1;
+  }
+  .arke-splash-subtitle {
+    font-family: "Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif;
+    font-size: 16px; color: #FFFFFF; opacity: 0.85;
+    letter-spacing: 0.08em; text-transform: lowercase;
+    margin-top: 6px;
+  }
+  .arke-splash-text {
+    font-size: 12px; color: #FFFFFF; opacity: 0.75;
+    margin-top: 32px; text-align: center;
+  }
   /* Modal backdrop */
   .arke-modal-backdrop {
     position: fixed; inset: 0; background: rgba(26,26,26,0.55); z-index: 1000;
@@ -41,7 +56,8 @@
   <div class="arke-splash" id="splash">
     <div style="text-align:center">
       <div class="arke-splash-mark">arke</div>
-      <div class="arke-splash-text">Cashflow Hub loading…</div>
+      <div class="arke-splash-subtitle">cashflow hub</div>
+      <div class="arke-splash-text">Loading…</div>
     </div>
   </div>
 </div>
@@ -772,7 +788,7 @@ function Sidebar({ isEditor, route, navigate, access }) {
       </a>
 
       {/* Nav */}
-      <nav style={{ flex: 1, overflowY: 'auto' }}>
+      <nav style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
         {items.map(it => {
           const active = seg === it.id;
           return (
@@ -799,10 +815,12 @@ function Sidebar({ isEditor, route, navigate, access }) {
         })}
       </nav>
 
-      {/* User block + sign-out at the bottom */}
+      {/* User block + sign-out at the bottom — flex-shrink: 0 ensures it never
+          gets squeezed out of view, even when nav content is tall. */}
       <div style={{
         borderTop: '1px solid rgba(255,255,255,0.2)',
-        padding: '14px 20px 0', marginTop: 8,
+        padding: '14px 20px 20px', marginTop: 8,
+        flexShrink: 0,
       }}>
         <div style={{ fontSize: 11, color: C.white, opacity: 0.7, marginBottom: 2 }}>Signed in as</div>
         <div style={{
