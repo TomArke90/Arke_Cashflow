@@ -1061,7 +1061,9 @@ function CashflowPage({ access }) {
 
   // Month-strip data: groups of consecutive weeks that share a month.
   // Used as a row of headers above the per-week headers at compact/tight zooms.
-  const monthGroups = useMemo(() => {
+  // Plain const (not useMemo) — this can't be a hook because it's after early
+  // returns above. It's also cheap enough to recompute each render.
+  const monthGroups = (() => {
     if (zoomConfig.fmt === 'full') return null;
     const groups = [];
     let current = null;
@@ -1078,7 +1080,7 @@ function CashflowPage({ access }) {
     }
     if (current) groups.push(current);
     return groups;
-  }, [weekColumns, zoomConfig.fmt]);
+  })();
 
   return (
     <div style={{ maxWidth: 1400 }}>
