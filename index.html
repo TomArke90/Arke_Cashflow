@@ -703,9 +703,9 @@ function SignInModal({ onClose, onSignedIn }) {
 function SignedInShell({ access, route, navigate, children }) {
   const isEditor = access.role === 'editor';
   return (
-    <div style={{ minHeight: '100vh', background: C.bg, display: 'flex' }}>
+    <div style={{ minHeight: '100vh', background: C.bg }}>
       <Sidebar isEditor={isEditor} route={route} navigate={navigate} access={access} />
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div style={{ marginLeft: 220, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         <main style={{ flex: 1, padding: '24px 32px 80px' }}>
           {children}
         </main>
@@ -732,8 +732,9 @@ function Sidebar({ isEditor, route, navigate, access }) {
       width: 220, background: C.red, color: C.white,
       padding: '24px 0 16px',
       display: 'flex', flexDirection: 'column',
-      position: 'sticky', top: 0, height: '100vh',
+      position: 'fixed', top: 0, left: 0, height: '100vh',
       flexShrink: 0,
+      zIndex: 10,
     }}>
       {/* Wordmark */}
       <a href="#/" style={{
