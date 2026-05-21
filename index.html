@@ -865,6 +865,8 @@ function ProjectDetailPage({ id, access, navigate }) {
 
       <CashflowReconciliationCard project={project} invoices={invoices} releases={releases} />
 
+      <ProjectLifecycleTimeline project={project} invoices={invoices} releases={releases} />
+
       <ProjectMiniCashflowSection project={project} invoices={invoices} releases={releases} />
 
       <AuditLogSection project={project} />
@@ -1473,6 +1475,19 @@ function RetentionReleasesSection({ project, releases, setReleases, access, show
   const updateRow = (key, field, value) => {
     markDirty(rows.map(r => r._key === key ? { ...r, [field]: value } : r));
   };
+  // Bidirectional % ↔ £ — typing in the % column writes both pct and amount;
+  // typing in the £ column writes amount only (pct is derived on display).
+  // % is relative to project value (per construction convention — defects retention
+  // is "2.5% of contract value" not "2.5% of the retention pot").
+  const projectValueNum = Number(project.value) || 0;
+  const updateAmountFromPct = (key, pct) => {
+    if (pct === '' || pct == null) {
+      markDirty(rows.map(r => r._key === key ? { ...r, amount: '' } : r));
+      return;
+    }
+    const amount = round2((Number(pct) / 100) * projectValueNum);
+    markDirty(rows.map(r => r._key === key ? { ...r, amount } : r));
+  };
 
   const save = async () => {
     setError('');
@@ -1597,50 +1612,93 @@ function RetentionReleasesSection({ project, releases, setReleases, access, show
       ) : (
         <div>
           <div style={{
-            display: 'grid', gridTemplateColumns: '1.2fr 1.3fr 1.4fr 1.8fr 40px',
+            display: 'grid', gridTemplateColumns: '1.2fr 0.7fr 1.1fr 1.3fr 1.6fr 40px',
             gap: 8, padding: '6px 4px',
             fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
           }}>
             <div>Date</div>
+            <div style={{ textAlign: 'right' }}>% of value</div>
             <div style={{ textAlign: 'right' }}>Amount £</div>
             <div>Release type</div>
             <div>Notes</div>
             <div></div>
           </div>
-          {rows.map(r => (
-            <div key={r._key} style={{
-              display: 'grid', gridTemplateColumns: '1.2fr 1.3fr 1.4fr 1.8fr 40px',
-              gap: 8, padding: '6px 4px', alignItems: 'flex-start',
-            }}>
-              <DateField
-                value={r.release_date}
-                onChange={(v) => updateRow(r._key, 'release_date', v)}
-                min={project.end_date || undefined}
-              />
-              <NumberInput
-                value={r.amount}
-                onChange={(v) => updateRow(r._key, 'amount', v)}
-                step="0.01" align="right"
-              />
-              <select
-                value={r.release_type}
-                onChange={(e) => updateRow(r._key, 'release_type', e.target.value)}
-                style={{ ...inp(), padding: '8px 8px' }}
-              >
-                <option value="">— Not specified —</option>
-                <option value="practical_completion">Practical Completion</option>
-                <option value="end_of_defects">End of Defects</option>
-                <option value="other">Other</option>
-              </select>
-              <input
-                value={r.notes}
-                onChange={(e) => updateRow(r._key, 'notes', e.target.value)}
-                style={inp()}
-                placeholder="Optional"
-              />
-              <button onClick={() => removeRow(r._key)} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
-            </div>
-          ))}
+          {rows.map(r => {
+            // Derive % live from amount + project value
+            const pctDisplay = (r.amount === '' || r.amount == null || projectValueNum === 0)
+              ? ''
+              : round2((Number(r.amount) / projectValueNum) * 100);
+            return (
+              <div key={r._key} style={{
+                display: 'grid', gridTemplateColumns: '1.2fr 0.7fr 1.1fr 1.3fr 1.6fr 40px',
+                gap: 8, padding: '6px 4px', alignItems: 'flex-start',
+              }}>
+                <DateField
+                  value={r.release_date}
+                  onChange={(v) => updateRow(r._key, 'release_date', v)}
+                  min={project.end_date || undefined}
+                />
+                <NumberInput
+                  value={pctDisplay}
+                  onChange={(v) => updateAmountFromPct(r._key, v)}
+                  step="0.01" align="right"
+                />
+                <NumberInput
+                  value={r.amount}
+                  onChange={(v) => updateRow(r._key, 'amount', v)}
+                  step="0.01" align="right"
+                />
+                <select
+                  value={r.release_type}
+                  onChange={(e) => updateRow(r._key, 'release_type', e.target.value)}
+                  style={{ ...inp(), padding: '8px 8px' }}
+                >
+                  <option value="">— Not specified —</option>
+                  <option value="practical_completion">Practical Completion</option>
+                  <option value="end_of_defects">End of Defects</option>
+                  <option value="other">Other</option>
+                </select>
+                <input
+                  value={r.notes}
+                  onChange={(e) => updateRow(r._key, 'notes', e.target.value)}
+                  style={inp()}
+                  placeholder="Optional"
+                />
+                <button onClick={() => removeRow(r._key)} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
+              </div>
+            );
+          })}
+          {/* Sum row */}
+          {(() => {
+            const sumAmount = rows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+            const sumPct = projectValueNum > 0 ? (sumAmount / projectValueNum) * 100 : 0;
+            const expectedPct = Number(project.retention_pct) || 0;
+            const matches = Math.abs(sumPct - expectedPct) < 0.005;
+            return (
+              <div style={{
+                display: 'grid', gridTemplateColumns: '1.2fr 0.7fr 1.1fr 1.3fr 1.6fr 40px',
+                gap: 8, padding: '10px 4px 4px',
+                borderTop: `2px solid ${C.line}`, marginTop: 8, alignItems: 'center',
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.text, paddingLeft: 4 }}>Sum</div>
+                <div style={{
+                  padding: '8px 8px', background: C.redSoft,
+                  border: `1px solid ${matches ? C.line : C.amber}`,
+                  borderRadius: 4, fontSize: 13, fontWeight: 700,
+                  color: matches ? C.green : C.amber, textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                }}>{sumPct.toFixed(2)}%</div>
+                <DerivedMoneyCell value={sumAmount} bold color={matches ? C.green : C.text} />
+                <div style={{ fontSize: 11, color: C.muted, paddingLeft: 4 }}>
+                  {expectedPct > 0 && (matches
+                    ? `✓ matches ${expectedPct}% retention`
+                    : `expected ${expectedPct}%`)}
+                </div>
+                <div></div>
+                <div></div>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -1934,6 +1992,252 @@ function ProjectMiniCashflowSection({ project, invoices, releases }) {
         </div>
       )}
     </SectionBox>
+  );
+}
+
+// ============================================================
+// PROJECT LIFECYCLE TIMELINE — Gantt-style visual of the whole project
+// Phases: active project band (start → end), defects period band (end → retention release)
+// Markers: each invoice payment date + each retention release date
+// ============================================================
+function ProjectLifecycleTimeline({ project, invoices, releases }) {
+  const start = project.start_date || null;
+  const end = project.end_date || null;
+  const retDate = project.retention_date || null;
+
+  // We need at least start + (end or retention) to draw a useful timeline
+  if (!start || (!end && !retDate)) {
+    return null;
+  }
+
+  // Compute the timeline window. From start, to the latest of: retDate, end + 1 day, last event
+  const today = new Date().toISOString().slice(0, 10);
+  const terms = Number(project.payment_terms_days) || 30;
+
+  // Build event list (invoices + releases + today marker)
+  const events = [];
+  for (const inv of (invoices || [])) {
+    const payDate = inv.payment_date_override
+      || (inv.invoice_date ? addDays(inv.invoice_date, terms) : null);
+    if (payDate) {
+      events.push({
+        date: payDate,
+        kind: 'invoice',
+        label: `Invoice ${inv.sequence}${inv.notes ? ' — ' + inv.notes : ''}`,
+      });
+    }
+  }
+  for (const r of (releases || [])) {
+    if (r.release_date) {
+      events.push({
+        date: r.release_date,
+        kind: 'retention',
+        label: `Retention release${r.release_type ? ' — ' + (RELEASE_TYPE_LABELS[r.release_type] || r.release_type) : ''} (£${fmtMoney(r.amount)})`,
+      });
+    }
+  }
+
+  // Determine the timeline's right edge
+  const candidates = [end, retDate, ...events.map(e => e.date)].filter(Boolean);
+  const lastDate = candidates.reduce((acc, d) => (cmpDate(d, acc) > 0 ? d : acc), start);
+  // Pad timeline 30 days past last event for breathing room
+  const timelineEnd = addDays(lastDate, 14);
+
+  // Position helper: convert ISO date → 0-1 ratio along timeline
+  const startMs = new Date(start + 'T00:00:00Z').getTime();
+  const endMs = new Date(timelineEnd + 'T00:00:00Z').getTime();
+  const range = endMs - startMs;
+  const ratio = (iso) => {
+    if (!iso) return null;
+    const ms = new Date(iso + 'T00:00:00Z').getTime();
+    if (isNaN(ms)) return null;
+    if (range === 0) return 0;
+    return Math.max(0, Math.min(1, (ms - startMs) / range));
+  };
+
+  // Phase bands: project (start → end) and defects (end → retDate)
+  const projectStartR = ratio(start);
+  const projectEndR = end ? ratio(end) : ratio(start);
+  const defectsEndR = retDate ? ratio(retDate) : null;
+
+  // Generate month tick marks across the range
+  const monthTicks = [];
+  {
+    const d = new Date(start + 'T00:00:00Z');
+    d.setUTCDate(1); // first of the month
+    while (d.getTime() <= endMs) {
+      const iso = d.toISOString().slice(0, 10);
+      const r = ratio(iso);
+      if (r != null && r >= 0 && r <= 1) {
+        monthTicks.push({
+          iso,
+          ratio: r,
+          // Show year only on January, otherwise just month abbrev
+          label: d.getUTCMonth() === 0
+            ? d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' })
+            : d.toLocaleDateString('en-GB', { month: 'short', timeZone: 'UTC' }),
+        });
+      }
+      d.setUTCMonth(d.getUTCMonth() + 1);
+    }
+  }
+
+  // Today marker (only show if it falls within the timeline window)
+  const todayR = (cmpDate(today, start) >= 0 && cmpDate(today, timelineEnd) <= 0)
+    ? ratio(today) : null;
+
+  // SVG dimensions
+  // Use a percentage-based layout so the timeline scales with the available container width.
+  // SVG with preserveAspectRatio: 'none' is the trick — viewBox stays fixed, content stretches.
+  const W = 1000;       // viewBox width
+  const H = 80;         // viewBox height
+  const Y_BAND_TOP = 18;
+  const Y_BAND_BOTTOM = 38;
+  const Y_MARKER = 52;
+  const Y_TICK_LABEL = 70;
+
+  return (
+    <SectionBox title="Project lifecycle">
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
+        Full lifecycle from project start through end of defects. Coloured bands show the active period and defects period; dots mark each scheduled cash event.
+      </div>
+
+      {/* Legend */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, marginBottom: 12, fontSize: 11, color: C.muted }}>
+        <LegendItem swatch={C.red} label="Project active" type="band" />
+        {retDate && <LegendItem swatch={C.prussian} label="Defects period" type="band" />}
+        <LegendItem swatch={C.green} label="Invoice payment" type="dot" />
+        <LegendItem swatch={C.amber} label="Retention release" type="dot" />
+        {todayR != null && <LegendItem swatch={C.text} label="Today" type="line" />}
+      </div>
+
+      <div style={{ width: '100%' }}>
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          preserveAspectRatio="none"
+          style={{ width: '100%', height: 100, display: 'block', overflow: 'visible' }}
+        >
+          {/* Phase bands */}
+          {/* Project active band */}
+          <rect
+            x={projectStartR * W} y={Y_BAND_TOP}
+            width={Math.max(2, (projectEndR - projectStartR) * W)} height={Y_BAND_BOTTOM - Y_BAND_TOP}
+            fill={C.red} opacity="0.85"
+            rx="2"
+          />
+          <title>Project active: {fmtDateShort(start)} → {end ? fmtDateShort(end) : '—'}</title>
+
+          {/* Defects period band (after end → retention release) */}
+          {end && retDate && defectsEndR != null && (
+            <g>
+              <rect
+                x={projectEndR * W} y={Y_BAND_TOP}
+                width={Math.max(2, (defectsEndR - projectEndR) * W)} height={Y_BAND_BOTTOM - Y_BAND_TOP}
+                fill={C.prussian} opacity="0.75"
+                rx="2"
+              />
+              <title>Defects period: {fmtDateShort(end)} → {fmtDateShort(retDate)}</title>
+            </g>
+          )}
+
+          {/* Today vertical line */}
+          {todayR != null && (
+            <g>
+              <line
+                x1={todayR * W} y1={Y_BAND_TOP - 6} x2={todayR * W} y2={Y_BAND_BOTTOM + 6}
+                stroke={C.text} strokeWidth="1.5" strokeDasharray="3,2"
+                vectorEffect="non-scaling-stroke"
+              />
+              <title>Today: {fmtDateShort(today)}</title>
+            </g>
+          )}
+
+          {/* Month tick marks + labels */}
+          {monthTicks.map((t, i) => (
+            <g key={i}>
+              <line
+                x1={t.ratio * W} y1={Y_BAND_BOTTOM + 2} x2={t.ratio * W} y2={Y_BAND_BOTTOM + 6}
+                stroke={C.muted} strokeWidth="1" vectorEffect="non-scaling-stroke"
+              />
+            </g>
+          ))}
+
+          {/* Event markers */}
+          {events.map((ev, i) => {
+            const r = ratio(ev.date);
+            if (r == null) return null;
+            const x = r * W;
+            const color = ev.kind === 'invoice' ? C.green : C.amber;
+            return (
+              <g key={i}>
+                <circle
+                  cx={x} cy={Y_MARKER} r="5"
+                  fill={color} stroke={C.white} strokeWidth="2"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <title>{ev.label} · {fmtDateShort(ev.date)}</title>
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* Month labels live in a separate flex row so the text doesn't get
+            stretched horizontally by preserveAspectRatio='none' on the SVG */}
+        <div style={{ position: 'relative', height: 16, marginTop: -4 }}>
+          {monthTicks.map((t, i) => (
+            <div key={i} style={{
+              position: 'absolute',
+              left: `${t.ratio * 100}%`,
+              transform: 'translateX(-50%)',
+              fontSize: 10, color: C.muted, fontWeight: 500,
+              whiteSpace: 'nowrap',
+            }}>
+              {t.label}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Phase date summary line */}
+      <div style={{ display: 'flex', gap: 16, marginTop: 18, fontSize: 11, flexWrap: 'wrap' }}>
+        <PhaseDate label="Start" value={start} color={C.red} />
+        {end && <PhaseDate label="End" value={end} color={C.red} />}
+        {retDate && <PhaseDate label="Retention release" value={retDate} color={C.prussian} />}
+        <PhaseDate label="Events" value={`${events.length} scheduled`} muted />
+      </div>
+    </SectionBox>
+  );
+}
+
+function LegendItem({ swatch, label, type }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+      {type === 'band' && (
+        <span style={{ width: 14, height: 8, background: swatch, opacity: 0.8, borderRadius: 2, display: 'inline-block' }} />
+      )}
+      {type === 'dot' && (
+        <span style={{ width: 8, height: 8, background: swatch, borderRadius: 4, display: 'inline-block', border: `1.5px solid ${C.white}`, boxShadow: `0 0 0 0.5px ${swatch}` }} />
+      )}
+      {type === 'line' && (
+        <span style={{
+          width: 14, height: 2, background: swatch, display: 'inline-block',
+          backgroundImage: `linear-gradient(to right, ${swatch} 60%, transparent 60%)`,
+          backgroundSize: '4px 100%',
+        }} />
+      )}
+      <span>{label}</span>
+    </span>
+  );
+}
+
+function PhaseDate({ label, value, color, muted }) {
+  return (
+    <span>
+      <span style={{ color: C.muted, marginRight: 5 }}>{label}:</span>
+      <span style={{ fontWeight: 600, color: muted ? C.muted : (color || C.text) }}>
+        {typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}$/) ? fmtDateShort(value) : value}
+      </span>
+    </span>
   );
 }
 
