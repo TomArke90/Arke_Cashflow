@@ -486,7 +486,7 @@ function RouteSwitch({ route, navigate, access }) {
     }
     if (route.path[1] === 'new') return <NewProjectWizard access={access} navigate={navigate} route={route} />;
     if (route.path[1] && route.path[2] === 'wizard') return <NewProjectWizard access={access} navigate={navigate} route={route} projectId={route.path[1]} />;
-    if (route.path[1]) return <ProjectDetailStub id={route.path[1]} access={access} />;
+    if (route.path[1]) return <ProjectDetailPage id={route.path[1]} access={access} navigate={navigate} />;
     return <ProjectsRegisterPage access={access} navigate={navigate} />;
   }
   if (seg === 'debtors') {
@@ -719,7 +719,1272 @@ function StubPage({ title, subtitle, children }) {
 }
 
 function CashflowPage({ access })       { return <StubPage title="Master cashflow" subtitle="Weekly grid of money in and overheads out.">Cashflow grid — Stage 5.</StubPage>; }
-function ProjectDetailStub({ id })      { return <StubPage title="Project detail" subtitle={`Project ID: ${id}`}>Project detail — Stage 4.</StubPage>; }
+// ============================================================
+// PROJECT DETAIL PAGE
+// The home of an individual project after wizard completion.
+// Composed of independent sections, each managing its own dirty/save state.
+// ============================================================
+function ProjectDetailPage({ id, access, navigate }) {
+  const [project, setProject] = useState(null);
+  const [invoices, setInvoices] = useState(null);
+  const [releases, setReleases] = useState(null);
+  const [assignees, setAssignees] = useState(null);
+  const [allUsers, setAllUsers] = useState(null);
+  const [error, setError] = useState(null);
+  const [flash, setFlash] = useState(null);
+
+  const isEditor = access.role === 'editor';
+
+  const showFlash = (kind, msg) => {
+    setFlash({ kind, msg });
+    setTimeout(() => setFlash(null), 5000);
+  };
+
+  // Load everything needed for the page
+  const loadAll = useCallback(async () => {
+    try {
+      const [proj, invs, rels, assigns] = await Promise.all([
+        sbSelect('projects', `id=eq.${id}&limit=1`, access.session),
+        sbSelect('project_invoices', `project_id=eq.${id}&order=sequence.asc`, access.session),
+        sbSelect('project_retention_releases', `project_id=eq.${id}&order=release_date.asc`, access.session),
+        sbSelect('project_contributors', `project_id=eq.${id}`, access.session),
+      ]);
+      if (!proj || proj.length === 0) {
+        setError('Project not found.');
+        return;
+      }
+      setProject(proj[0]);
+      setInvoices(invs || []);
+      setReleases(rels || []);
+      setAssignees(assigns || []);
+    } catch (e) { setError(e.message); }
+  }, [id, access.session]);
+
+  // Editors can see the full user list (RLS allows). Contributors don't need it
+  // — they can't see the assignees section anyway.
+  const loadUsers = useCallback(async () => {
+    if (!isEditor) return;
+    try {
+      const u = await sbSelect('cashflow_users', 'select=user_id,email,display_name,role,active&active=eq.true&order=display_name.asc', access.session);
+      setAllUsers(u || []);
+    } catch (e) { /* non-fatal */ }
+  }, [isEditor, access.session]);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+  useEffect(() => { loadUsers(); }, [loadUsers]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (project === null) return <LoadingMsg label="Loading project…" />;
+
+  // Drafts shouldn't really be reached here (wizard handles them) but if a
+  // contributor somehow gets here, route them politely.
+  if (project.status === 'draft') {
+    if (isEditor) {
+      // Push editor back into the wizard
+      return <Redirect navigate={navigate} to={['projects', id, 'wizard']} />;
+    }
+    // Contributors see a placeholder
+    return (
+      <div style={{ maxWidth: 720 }}>
+        <BackLink href={buildHash(['projects'])}>Projects</BackLink>
+        <h1 style={brandTitle()}>{project.name}</h1>
+        <Card>
+          <p style={{ color: C.muted, fontSize: 14, margin: 0 }}>
+            This project is still in draft. It will appear in full once an editor activates it.
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 1080 }}>
+      <BackLink href={buildHash(['projects'])}>Projects</BackLink>
+
+      {flash && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 16, borderRadius: 6,
+          background: flash.kind === 'ok' ? C.greenLight : C.redStatusLight,
+          color: flash.kind === 'ok' ? C.green : C.redStatus,
+          borderLeft: `3px solid ${flash.kind === 'ok' ? C.green : C.redStatus}`,
+          fontSize: 13,
+        }}>{flash.msg}</div>
+      )}
+
+      <ProjectDetailHeader
+        project={project} setProject={setProject}
+        access={access} isEditor={isEditor}
+        showFlash={showFlash} reloadAll={loadAll}
+      />
+
+      <HeaderSection
+        project={project} setProject={setProject}
+        access={access} showFlash={showFlash}
+      />
+
+      <ScheduleSection
+        project={project} invoices={invoices} setInvoices={setInvoices}
+        access={access} showFlash={showFlash}
+      />
+
+      <RetentionReleasesSection
+        project={project} releases={releases} setReleases={setReleases}
+        access={access} showFlash={showFlash}
+      />
+
+      <RetentionPotCard project={project} invoices={invoices} releases={releases} />
+
+      <ProjectMiniCashflowSection project={project} invoices={invoices} releases={releases} />
+
+      {isEditor && (
+        <AssigneesSection
+          project={project} assignees={assignees} setAssignees={setAssignees}
+          allUsers={allUsers} access={access} showFlash={showFlash}
+          reloadAssignees={loadAll}
+        />
+      )}
+
+      <AuditLogSection project={project} />
+    </div>
+  );
+}
+
+// ============================================================
+// HEADER STRIP — name, status badge, actions
+// ============================================================
+function ProjectDetailHeader({ project, setProject, access, isEditor, showFlash, reloadAll }) {
+  const [confirm, setConfirm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const badge = PROJECT_STATUS_BADGE[project.status] || PROJECT_STATUS_BADGE.draft;
+
+  // Status transitions:
+  //  active ↔ complete ↔ archived (one step at a time)
+  //  also: any → archived (escape hatch)
+  //  archived → previous status (un-archive)
+  const isArchived = project.status === 'archived';
+
+  const transition = async (toStatus, options) => {
+    options = options || {};
+    const at = new Date().toISOString();
+    const actor = getEmail(access.session);
+    setBusy(true);
+    try {
+      const updates = {
+        status: toStatus,
+        // When archiving, remember current status so we can un-archive cleanly.
+        ...(toStatus === 'archived' ? { pre_archive_status: project.status } : {}),
+        ...(options.clearPreArchive ? { pre_archive_status: null } : {}),
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: options.event || 'status_changed', from: project.status, to: toStatus, actor, at },
+        ],
+      };
+      const result = await sbUpdate('projects', `id=eq.${project.id}`, updates, access.session);
+      setProject(result[0]);
+      showFlash('ok', `Project ${options.event === 'unarchived' ? 'un-archived' : 'moved to ' + toStatus}.`);
+    } catch (e) {
+      showFlash('err', 'Could not update status: ' + e.message);
+    } finally {
+      setBusy(false);
+      setConfirm(null);
+    }
+  };
+
+  const unarchive = async () => {
+    const restoreTo = project.pre_archive_status || 'active';
+    await transition(restoreTo, { event: 'unarchived', clearPreArchive: true });
+  };
+
+  // Allowed forward/backward transitions one-step-at-a-time, plus jump-to-archive.
+  const allowedNext = {
+    active:   { forward: 'complete' },
+    complete: { forward: 'archived', backward: 'active' },
+    archived: {},
+  };
+  const next = allowedNext[project.status] || {};
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>{project.name || '(no name)'}</h1>
+          <div style={{ fontSize: 13, color: C.muted, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+            {project.number && <span style={{ fontFamily: 'monospace' }}>{project.number}</span>}
+            <span style={{
+              background: badge.bg, color: badge.fg, padding: '3px 10px', borderRadius: 10,
+              fontSize: 11, fontWeight: 600,
+            }}>● {badge.label}</span>
+            {project.owner_email && <span>Owner: {project.owner_email}</span>}
+          </div>
+        </div>
+        {isEditor && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            {isArchived ? (
+              <button onClick={unarchive} disabled={busy} style={btn(busy)}>↺ Un-archive</button>
+            ) : (
+              <React.Fragment>
+                {next.backward && (
+                  <button
+                    onClick={() => setConfirm({
+                      title: `Move back to ${next.backward}?`,
+                      message: `This will change the project status from ${project.status} back to ${next.backward}.`,
+                      confirmLabel: `Move to ${next.backward}`,
+                      onConfirm: () => transition(next.backward),
+                    })}
+                    style={btnGhost()}
+                  >← {next.backward.charAt(0).toUpperCase() + next.backward.slice(1)}</button>
+                )}
+                {next.forward && next.forward !== 'archived' && (
+                  <button
+                    onClick={() => setConfirm({
+                      title: `Mark as ${next.forward}?`,
+                      message: `This will change the project status from ${project.status} to ${next.forward}.`,
+                      confirmLabel: `Mark as ${next.forward}`,
+                      onConfirm: () => transition(next.forward),
+                    })}
+                    style={btn(false)}
+                  >{next.forward.charAt(0).toUpperCase() + next.forward.slice(1)} →</button>
+                )}
+                <button
+                  onClick={() => setConfirm({
+                    title: 'Archive project?',
+                    message: 'Archiving removes this project from the active register and the cashflow grid. You can un-archive it later if needed.',
+                    confirmLabel: 'Archive',
+                    destructive: true,
+                    onConfirm: () => transition('archived'),
+                  })}
+                  style={{ ...btnGhost(), color: C.muted }}
+                >Archive</button>
+              </React.Fragment>
+            )}
+          </div>
+        )}
+      </div>
+      {confirm && (
+        <ConfirmModal {...confirm} busy={busy} onCancel={() => setConfirm(null)} />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// HEADER SECTION — display + edit modes
+// ============================================================
+function HeaderSection({ project, setProject, access, showFlash }) {
+  const [editing, setEditing] = useState(false);
+
+  if (!editing) {
+    return (
+      <SectionBox title="Project header" actions={
+        <button onClick={() => setEditing(true)} style={miniBtn()}>✎ Edit</button>
+      }>
+        <HeaderDisplay project={project} />
+      </SectionBox>
+    );
+  }
+  return (
+    <SectionBox title="Project header — editing">
+      <HeaderEditor
+        project={project}
+        onSave={(updated) => { setProject(updated); setEditing(false); showFlash('ok', 'Header updated.'); }}
+        onCancel={() => setEditing(false)}
+        access={access}
+      />
+    </SectionBox>
+  );
+}
+
+function HeaderDisplay({ project }) {
+  const fields = [
+    { label: 'Project name', value: project.name },
+    { label: 'Project number', value: project.number },
+    { label: 'Value', value: project.value != null ? `£${fmtMoney(project.value)}` : null },
+    { label: 'Retention', value: project.retention_pct != null ? fmtPct(project.retention_pct) : null },
+    { label: 'Defects retention', value: project.defects_retention_pct != null ? fmtPct(project.defects_retention_pct) : '—' },
+    { label: 'Start date', value: project.start_date ? fmtDateShort(project.start_date) : null },
+    { label: 'End date', value: project.end_date ? fmtDateShort(project.end_date) : null },
+    { label: 'Retention release date', value: project.retention_date ? fmtDateShort(project.retention_date) : null },
+    { label: 'Payment terms', value: `${project.payment_terms_days} days` },
+    { label: 'Owner', value: project.owner_email },
+    { label: 'Payment type', value: project.payment_type === 'stage' ? 'Stage payment' : (project.payment_type === 'valuation' ? 'Valuation' : '—') },
+  ];
+  if (project.payment_type === 'valuation') {
+    fields.push(
+      { label: 'First valuation', value: project.first_valuation_date ? fmtDateShort(project.first_valuation_date) : null },
+      { label: 'Cycle', value: project.valuation_cycle_days ? `${project.valuation_cycle_days} days` : null },
+      { label: 'Review period', value: project.review_period_days != null ? `${project.review_period_days} days` : null },
+    );
+  }
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 24px' }}>
+      {fields.map(f => (
+        <div key={f.label} style={{ display: 'flex', gap: 12, minWidth: 0 }}>
+          <div style={{ width: 170, fontSize: 12, color: C.muted, fontWeight: 500, flexShrink: 0 }}>{f.label}</div>
+          <div style={{ fontSize: 13, color: f.value ? C.text : C.muted, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {f.value || '—'}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HeaderEditor({ project, onSave, onCancel, access }) {
+  // Re-uses the wizard's Step 1 form shape. Saves directly here, doesn't navigate.
+  const [form, setForm] = useState(() => ({
+    name:                  project.name || '',
+    number:                project.number || '',
+    value:                 project.value != null ? project.value : '',
+    retention_pct:         project.retention_pct != null ? project.retention_pct : '',
+    defects_retention_pct: project.defects_retention_pct != null ? project.defects_retention_pct : '',
+    start_date:            project.start_date || '',
+    end_date:              project.end_date || '',
+    retention_date:        project.retention_date || '',
+    payment_terms_days:    project.payment_terms_days,
+    owner_email:           project.owner_email || '',
+    first_valuation_date:  project.first_valuation_date || '',
+    valuation_cycle_days:  project.valuation_cycle_days != null ? project.valuation_cycle_days : '',
+    review_period_days:    project.review_period_days != null ? project.review_period_days : '',
+  }));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const endBeforeStart = form.start_date && form.end_date && cmpDate(form.end_date, form.start_date) < 0;
+  const retentionBeforeEnd = form.end_date && form.retention_date && cmpDate(form.retention_date, form.end_date) < 0;
+  const defectsExceedsRetention =
+    form.defects_retention_pct !== '' && form.retention_pct !== ''
+    && Number(form.defects_retention_pct) > Number(form.retention_pct);
+
+  const valid =
+    form.name && form.name.trim().length > 0
+    && Number(form.value) >= 0
+    && !endBeforeStart
+    && !retentionBeforeEnd;
+
+  const update = (field, val) => setForm(prev => ({ ...prev, [field]: val }));
+
+  const save = async () => {
+    if (!valid) return;
+    setBusy(true); setError('');
+    try {
+      const payload = {
+        name: form.name.trim(),
+        number: form.number.trim() || null,
+        value: Number(form.value) || 0,
+        retention_pct: form.retention_pct === '' ? 0 : Number(form.retention_pct),
+        defects_retention_pct: form.defects_retention_pct === '' ? null : Number(form.defects_retention_pct),
+        start_date: form.start_date || null,
+        end_date: form.end_date || null,
+        retention_date: form.retention_date || null,
+        payment_terms_days: Number(form.payment_terms_days) || 30,
+        owner_email: form.owner_email.trim() || null,
+        first_valuation_date: project.payment_type === 'valuation' ? (form.first_valuation_date || null) : null,
+        valuation_cycle_days: project.payment_type === 'valuation' && form.valuation_cycle_days !== '' ? Number(form.valuation_cycle_days) : null,
+        review_period_days: project.payment_type === 'valuation' && form.review_period_days !== '' ? Number(form.review_period_days) : null,
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: 'header_edited', actor: getEmail(access.session), at: new Date().toISOString() },
+        ],
+      };
+      const updated = await sbUpdate('projects', `id=eq.${project.id}`, payload, access.session);
+      onSave(updated[0]);
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div>
+      <Field label="Project name *">
+        <input value={form.name} onChange={(e) => update('name', e.target.value)} style={inp()} />
+      </Field>
+      <div style={twoCol()}>
+        <Field label="Project number">
+          <input value={form.number} onChange={(e) => update('number', e.target.value)} style={inp()} />
+        </Field>
+        <Field label="Owner">
+          <input value={form.owner_email} onChange={(e) => update('owner_email', e.target.value)} style={inp()} />
+        </Field>
+      </div>
+      <div style={threeCol()}>
+        <Field label="Project value (£)">
+          <MoneyInput value={form.value} onChange={(v) => update('value', v)} />
+        </Field>
+        <Field label="Retention (%)">
+          <NumberInput value={form.retention_pct} onChange={(v) => update('retention_pct', v)} step="0.01" />
+        </Field>
+        <Field label="Defects retention (%)">
+          <NumberInput value={form.defects_retention_pct} onChange={(v) => update('defects_retention_pct', v)} step="0.01" placeholder="optional" />
+          {defectsExceedsRetention && (
+            <div style={{ fontSize: 11, color: C.amber, marginTop: 3, fontWeight: 500 }}>
+              ⚠ Defects retention exceeds total retention
+            </div>
+          )}
+        </Field>
+      </div>
+      <div style={threeCol()}>
+        <Field label="Start date">
+          <DateField value={form.start_date} onChange={(v) => update('start_date', v)} />
+        </Field>
+        <Field label="End date">
+          <DateField value={form.end_date} onChange={(v) => update('end_date', v)} min={form.start_date || undefined}
+            warning={endBeforeStart ? 'End date must be on or after start date' : null} error={endBeforeStart} />
+        </Field>
+        <Field label="Retention release date">
+          <DateField value={form.retention_date} onChange={(v) => update('retention_date', v)} min={form.end_date || form.start_date || undefined}
+            warning={retentionBeforeEnd ? 'Retention is released after project end' : null} error={retentionBeforeEnd} />
+        </Field>
+      </div>
+      <Field label="Payment terms (days)">
+        <NumberInput value={form.payment_terms_days} onChange={(v) => update('payment_terms_days', v)} step="1" />
+      </Field>
+      {project.payment_type === 'valuation' && (
+        <div style={threeCol()}>
+          <Field label="First valuation date">
+            <DateField value={form.first_valuation_date} onChange={(v) => update('first_valuation_date', v)} />
+          </Field>
+          <Field label="Valuation cycle (days)">
+            <NumberInput value={form.valuation_cycle_days} onChange={(v) => update('valuation_cycle_days', v)} step="1" />
+          </Field>
+          <Field label="Review period (days)">
+            <NumberInput value={form.review_period_days} onChange={(v) => update('review_period_days', v)} step="1" />
+          </Field>
+        </div>
+      )}
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+        <button onClick={onCancel} style={btnGhost()} disabled={busy}>Cancel</button>
+        <button onClick={save} disabled={!valid || busy} style={btn(!valid || busy)}>
+          {busy ? 'Saving…' : 'Save changes'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SCHEDULE SECTION
+// In-place editor for the project's invoice/claim schedule.
+// Uses the same row editors as the wizard. Dirty-tracked with explicit save.
+// ============================================================
+function ScheduleSection({ project, invoices, setInvoices, access, showFlash }) {
+  const [rows, setRows] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const projectValue = Number(project.value) || 0;
+  const isStage = project.payment_type === 'stage';
+
+  // Seed local state from server data; reset on server change unless user is editing
+  useEffect(() => {
+    if (invoices === null) return;
+    if (!dirty) {
+      setRows(invoices.map((r, i) => ({
+        _key: r.id || `existing-${i}-${Math.random()}`,
+        id: r.id,
+        sequence: r.sequence,
+        invoice_date: r.invoice_date || '',
+        payment_date_override: r.payment_date_override || '',
+        invoice_pct: r.invoice_pct == null ? '' : r.invoice_pct,
+        invoice_value_net: r.invoice_value_net == null ? '' : r.invoice_value_net,
+        notes: r.notes || '',
+      })));
+    }
+  }, [invoices, dirty]);
+
+  if (rows === null) return null;
+
+  const markDirty = (next) => { setRows(next); setDirty(true); };
+
+  const addRow = () => {
+    markDirty([...rows, {
+      _key: `new-${Date.now()}-${Math.random()}`,
+      id: null, sequence: rows.length + 1,
+      invoice_date: '', payment_date_override: '',
+      invoice_pct: isStage ? '' : null,
+      invoice_value_net: isStage ? null : '',
+      notes: '',
+    }]);
+  };
+  const removeRow = (key) => {
+    markDirty(rows.filter(r => r._key !== key).map((r, i) => ({ ...r, sequence: i + 1 })));
+  };
+  const updateRow = (key, field, value) => {
+    markDirty(rows.map(r => r._key === key ? { ...r, [field]: value } : r));
+  };
+
+  // Stage validation: % must sum to 100
+  const sumPct = isStage ? rows.reduce((s, r) => s + (Number(r.invoice_pct) || 0), 0) : null;
+  const validSum = !isStage || Math.abs(sumPct - 100) <= 0.005;
+
+  const save = async () => {
+    setError('');
+    if (rows.length === 0) { setError(`Add at least one ${isStage ? 'stage' : 'claim'}.`); return; }
+    if (rows.some(r => !r.invoice_date)) { setError(`Every row needs an invoice date.`); return; }
+    if (isStage && !validSum) { setError('Stages must sum to 100%.'); return; }
+    if (!isStage && rows.some(r => r.invoice_value_net === '' || Number(r.invoice_value_net) <= 0)) {
+      setError('Every claim needs a positive value.'); return;
+    }
+    const bad = rows.find(r => r.payment_date_override && cmpDate(r.payment_date_override, r.invoice_date) < 0);
+    if (bad) { setError(`Row ${bad.sequence}: payment date is before the invoice date.`); return; }
+
+    setBusy(true);
+    try {
+      // Wipe-and-rewrite — matches wizard pattern
+      await sbDelete('project_invoices', `project_id=eq.${project.id}`, access.session);
+      const pctToGbp = (p) => Number(p) / 100 * projectValue;
+      const inserts = rows.map(r => ({
+        project_id: project.id,
+        sequence: r.sequence,
+        invoice_date: r.invoice_date,
+        payment_date_override: r.payment_date_override || null,
+        invoice_pct: isStage ? Number(r.invoice_pct) : null,
+        invoice_value_net: isStage ? pctToGbp(r.invoice_pct) : Number(r.invoice_value_net),
+        notes: r.notes || null,
+      }));
+      let newRows = [];
+      if (inserts.length > 0) {
+        newRows = await sbInsert('project_invoices', inserts, access.session);
+      }
+      // Log structural event
+      await sbUpdate('projects', `id=eq.${project.id}`, {
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: 'schedule_edited', actor: getEmail(access.session), at: new Date().toISOString(), row_count: rows.length },
+        ],
+      }, access.session);
+      setInvoices(newRows);
+      setDirty(false);
+      showFlash('ok', 'Schedule saved.');
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  const discard = () => {
+    setRows(invoices.map((r, i) => ({
+      _key: r.id || `existing-${i}-${Math.random()}`,
+      id: r.id, sequence: r.sequence,
+      invoice_date: r.invoice_date || '',
+      payment_date_override: r.payment_date_override || '',
+      invoice_pct: r.invoice_pct == null ? '' : r.invoice_pct,
+      invoice_value_net: r.invoice_value_net == null ? '' : r.invoice_value_net,
+      notes: r.notes || '',
+    })));
+    setDirty(false); setError('');
+  };
+
+  const titleSuffix = isStage ? 'Stage payments' : 'Valuation claims';
+
+  return (
+    <SectionBox
+      title={`Schedule — ${titleSuffix}`}
+      actions={
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {dirty && <span style={{ fontSize: 11, color: C.amber, fontWeight: 600 }}>● Unsaved</span>}
+          <button onClick={addRow} style={miniBtn()}>+ Add row</button>
+        </div>
+      }
+    >
+      {rows.length === 0 ? (
+        <div style={{ padding: 24, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
+          No {isStage ? 'stages' : 'claims'} yet. Click + Add row above.
+        </div>
+      ) : (
+        <div>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: isStage ? '40px 1.3fr 1.5fr 1fr 1.8fr 40px' : '40px 1.3fr 1.5fr 1.3fr 1.8fr 40px',
+            gap: 8, padding: '6px 4px',
+            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>#</div>
+            <div>Invoice date</div>
+            <div>Payment date</div>
+            <div style={{ textAlign: 'right' }}>{isStage ? '% of value' : '£ gross'}</div>
+            <div>Notes</div>
+            <div></div>
+          </div>
+          {rows.map(r => isStage ? (
+            <StageRowEditor
+              key={r._key} row={r} mode="pct" project={project} projectValue={projectValue}
+              onChange={(field, value) => updateRow(r._key, field, value)}
+              onRemove={() => removeRow(r._key)}
+            />
+          ) : (
+            <ValuationRowEditor
+              key={r._key} row={r} project={project}
+              onChange={(field, value) => updateRow(r._key, field, value)}
+              onRemove={() => removeRow(r._key)}
+            />
+          ))}
+          {isStage && (
+            <div style={{
+              display: 'grid', gridTemplateColumns: '40px 1.3fr 1.5fr 1fr 1.8fr 40px',
+              gap: 8, padding: '10px 4px 4px', borderTop: `1px solid ${C.line}`, marginTop: 8, alignItems: 'center',
+            }}>
+              <div></div>
+              <div></div>
+              <div style={{ fontSize: 12, fontWeight: 700, textAlign: 'right' }}>Sum</div>
+              <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums',
+                color: validSum ? C.green : C.redStatus }}>
+                {sumPct.toFixed(4).replace(/\.?0+$/, '')}%
+              </div>
+              <div style={{ fontSize: 12, color: validSum ? C.green : C.redStatus, fontWeight: 600 }}>
+                {validSum ? '✓ Matches 100%' : `Need 100% — ${(100 - sumPct).toFixed(4).replace(/\.?0+$/, '')}% to go`}
+              </div>
+              <div></div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      {dirty && (
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.line}` }}>
+          <button onClick={discard} disabled={busy} style={btnGhost()}>Discard</button>
+          <button onClick={save} disabled={busy || (isStage && !validSum)} style={btn(busy || (isStage && !validSum))}>
+            {busy ? 'Saving…' : 'Save schedule'}
+          </button>
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// RETENTION RELEASES SECTION
+// Like the schedule editor but simpler — release date + amount + type + notes.
+// ============================================================
+const RELEASE_TYPE_LABELS = {
+  practical_completion: 'Practical Completion',
+  end_of_defects:       'End of Defects',
+  other:                'Other',
+};
+
+function RetentionReleasesSection({ project, releases, setReleases, access, showFlash }) {
+  const [rows, setRows] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (releases === null) return;
+    if (!dirty) {
+      setRows(releases.map((r, i) => ({
+        _key: r.id || `existing-${i}-${Math.random()}`,
+        id: r.id,
+        release_date: r.release_date || '',
+        amount: r.amount == null ? '' : r.amount,
+        release_type: r.release_type || '',
+        notes: r.notes || '',
+      })));
+    }
+  }, [releases, dirty]);
+
+  if (rows === null) return null;
+
+  const markDirty = (next) => { setRows(next); setDirty(true); };
+
+  const addRow = () => {
+    markDirty([...rows, {
+      _key: `new-${Date.now()}-${Math.random()}`,
+      id: null, release_date: '', amount: '', release_type: '', notes: '',
+    }]);
+  };
+  const removeRow = (key) => markDirty(rows.filter(r => r._key !== key));
+  const updateRow = (key, field, value) => {
+    markDirty(rows.map(r => r._key === key ? { ...r, [field]: value } : r));
+  };
+
+  const save = async () => {
+    setError('');
+    if (rows.some(r => !r.release_date)) { setError('Every release needs a date.'); return; }
+    if (rows.some(r => r.amount === '' || Number(r.amount) === 0)) { setError('Every release needs a non-zero amount.'); return; }
+    setBusy(true);
+    try {
+      await sbDelete('project_retention_releases', `project_id=eq.${project.id}`, access.session);
+      const inserts = rows.map(r => ({
+        project_id: project.id,
+        release_date: r.release_date,
+        amount: Number(r.amount),
+        release_type: r.release_type || null,
+        notes: r.notes || null,
+      }));
+      let newRows = [];
+      if (inserts.length > 0) newRows = await sbInsert('project_retention_releases', inserts, access.session);
+      await sbUpdate('projects', `id=eq.${project.id}`, {
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: 'retention_edited', actor: getEmail(access.session), at: new Date().toISOString(), row_count: rows.length },
+        ],
+      }, access.session);
+      setReleases(newRows);
+      setDirty(false);
+      showFlash('ok', 'Retention releases saved.');
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const discard = () => {
+    setRows(releases.map((r, i) => ({
+      _key: r.id || `existing-${i}-${Math.random()}`,
+      id: r.id,
+      release_date: r.release_date || '',
+      amount: r.amount == null ? '' : r.amount,
+      release_type: r.release_type || '',
+      notes: r.notes || '',
+    })));
+    setDirty(false); setError('');
+  };
+
+  // Suggested guidance based on header settings
+  const totalWithheld = (Number(project.retention_pct) || 0) / 100 * (Number(project.value) || 0);
+  const defectsAmount = project.defects_retention_pct != null
+    ? Number(project.defects_retention_pct) / 100 * (Number(project.value) || 0)
+    : null;
+  const pcAmount = defectsAmount != null ? totalWithheld - defectsAmount : null;
+
+  return (
+    <SectionBox
+      title="Retention releases"
+      actions={
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {dirty && <span style={{ fontSize: 11, color: C.amber, fontWeight: 600 }}>● Unsaved</span>}
+          <button onClick={addRow} style={miniBtn()}>+ Add release</button>
+        </div>
+      }
+    >
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, padding: '8px 12px', background: C.bg, borderRadius: 6, lineHeight: 1.5 }}>
+        Add cash events for retention being released back to Arke. Each appears as a separate cash-in row on the cashflow grid.
+        {totalWithheld > 0 && (
+          <React.Fragment>
+            {' '}This project is expected to withhold <strong>£{fmtMoney(totalWithheld)}</strong> in total retention
+            {pcAmount != null && (
+              <span> — typically released as <strong>£{fmtMoney(pcAmount)}</strong> at Practical Completion and <strong>£{fmtMoney(defectsAmount)}</strong> at End of Defects.</span>
+            )}
+          </React.Fragment>
+        )}
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ padding: 24, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
+          No retention releases yet. Click + Add release.
+        </div>
+      ) : (
+        <div>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1.2fr 1.3fr 1.4fr 1.8fr 40px',
+            gap: 8, padding: '6px 4px',
+            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            <div>Date</div>
+            <div style={{ textAlign: 'right' }}>Amount £</div>
+            <div>Release type</div>
+            <div>Notes</div>
+            <div></div>
+          </div>
+          {rows.map(r => (
+            <div key={r._key} style={{
+              display: 'grid', gridTemplateColumns: '1.2fr 1.3fr 1.4fr 1.8fr 40px',
+              gap: 8, padding: '6px 4px', alignItems: 'flex-start',
+            }}>
+              <DateField
+                value={r.release_date}
+                onChange={(v) => updateRow(r._key, 'release_date', v)}
+                min={project.end_date || undefined}
+              />
+              <NumberInput
+                value={r.amount}
+                onChange={(v) => updateRow(r._key, 'amount', v)}
+                step="0.01" align="right"
+              />
+              <select
+                value={r.release_type}
+                onChange={(e) => updateRow(r._key, 'release_type', e.target.value)}
+                style={{ ...inp(), padding: '8px 8px' }}
+              >
+                <option value="">— Not specified —</option>
+                <option value="practical_completion">Practical Completion</option>
+                <option value="end_of_defects">End of Defects</option>
+                <option value="other">Other</option>
+              </select>
+              <input
+                value={r.notes}
+                onChange={(e) => updateRow(r._key, 'notes', e.target.value)}
+                style={inp()}
+                placeholder="Optional"
+              />
+              <button onClick={() => removeRow(r._key)} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          {error}
+        </div>
+      )}
+
+      {dirty && (
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.line}` }}>
+          <button onClick={discard} disabled={busy} style={btnGhost()}>Discard</button>
+          <button onClick={save} disabled={busy} style={btn(busy)}>
+            {busy ? 'Saving…' : 'Save releases'}
+          </button>
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// RETENTION POT CARD — shows withheld / released / balance
+// ============================================================
+function RetentionPotCard({ project, invoices, releases }) {
+  const retPct = Number(project.retention_pct) || 0;
+  if (retPct === 0) return null;
+
+  const projectValue = Number(project.value) || 0;
+  const totalExpected = retPct / 100 * projectValue;
+
+  // Withheld so far = sum over invoices of (gross × retention%)
+  // For stage rows: gross = invoice_pct/100 × project_value
+  // For valuation rows: gross = invoice_value_net (already gross of retention)
+  const withheld = (invoices || []).reduce((sum, inv) => {
+    let gross = 0;
+    if (inv.invoice_pct != null) {
+      gross = (Number(inv.invoice_pct) / 100) * projectValue;
+    } else if (inv.invoice_value_net != null) {
+      gross = Number(inv.invoice_value_net);
+    }
+    return sum + gross * (retPct / 100);
+  }, 0);
+
+  const released = (releases || []).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+  const balance = withheld - released;
+
+  // Helper for the "in/out" tile colours
+  const stat = (label, value, color) => (
+    <div style={{ minWidth: 0 }}>
+      <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: color || C.text, fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
+        £{fmtMoney(value)}
+      </div>
+    </div>
+  );
+
+  // Sanity-check warning
+  const reconciles = Math.abs(withheld - released) < 0.01;
+  const overReleased = released > withheld + 0.01;
+
+  return (
+    <SectionBox title="Retention pot">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
+        {stat('Expected total', totalExpected, C.text)}
+        {stat('Withheld so far', withheld, C.prussian)}
+        {stat('Released so far', released, C.green)}
+        {stat('Balance held', balance, balance < 0 ? C.redStatus : C.text)}
+      </div>
+      {overReleased && (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 12, marginTop: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+          ⚠ Releases exceed withheld retention. Check your release rows against the invoiced amounts.
+        </div>
+      )}
+      {!overReleased && reconciles && withheld > 0 && (
+        <div style={{ background: C.greenLight, color: C.green, padding: 10, borderRadius: 6, fontSize: 12, marginTop: 12, borderLeft: `3px solid ${C.green}`, fontWeight: 500 }}>
+          ✓ Retention fully reconciled.
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// PROJECT CASHFLOW ENGINE
+// Compute per-cash-event details for a single project.
+// Used by the mini-cashflow section here and (later) the master grid.
+// Returns array of { date: ISO, gross, label, source }.
+// ============================================================
+function projectCashEvents(project, invoices, releases) {
+  const events = [];
+  const projectValue = Number(project.value) || 0;
+  const retPct = Number(project.retention_pct) || 0;
+  const vatRate = Number(project.vat_rate) != null ? Number(project.vat_rate) : 0.20;
+  const terms = Number(project.payment_terms_days) || 30;
+
+  for (const inv of (invoices || [])) {
+    // Gross amount (before retention deduction):
+    //  stage rows: pct × project_value
+    //  valuation rows: invoice_value_net (already gross)
+    let gross = 0;
+    if (inv.invoice_pct != null) {
+      gross = (Number(inv.invoice_pct) / 100) * projectValue;
+    } else if (inv.invoice_value_net != null) {
+      gross = Number(inv.invoice_value_net);
+    }
+    const claim = gross * (1 - retPct / 100);     // what arrives in Arke's bank net-of-retention
+    const vat = claim * vatRate;
+    const cashIn = claim + vat;
+    const payDate = inv.payment_date_override || (inv.invoice_date ? addDays(inv.invoice_date, terms) : '');
+    if (payDate) {
+      events.push({
+        date: payDate,
+        gross: cashIn,
+        label: `Invoice ${inv.sequence}${inv.notes ? ' — ' + inv.notes : ''}`,
+        source: 'invoice',
+        breakdown: { gross, retention: gross - claim, claim, vat },
+      });
+    }
+  }
+
+  for (const r of (releases || [])) {
+    const amount = Number(r.amount) || 0;
+    const vat = amount * vatRate;
+    const cashIn = amount + vat;
+    events.push({
+      date: r.release_date,
+      gross: cashIn,
+      label: `Retention release${r.release_type ? ' — ' + RELEASE_TYPE_LABELS[r.release_type] : ''}`,
+      source: 'retention',
+      breakdown: { amount, vat },
+    });
+  }
+
+  events.sort((a, b) => cmpDate(a.date, b.date));
+  return events;
+}
+
+// Find the Monday of the week containing an ISO date
+function mondayOf(iso) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return '';
+  // getUTCDay: Sun=0..Sat=6. We want Mon as start of week.
+  const day = d.getUTCDay();
+  const diff = (day === 0 ? -6 : 1 - day);
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+// ============================================================
+// PROJECT MINI-CASHFLOW
+// Shows 13 weeks of this project's cash events, from this week onward.
+// ============================================================
+function ProjectMiniCashflowSection({ project, invoices, releases }) {
+  const events = useMemo(() => projectCashEvents(project, invoices, releases), [project, invoices, releases]);
+
+  // Build a 13-week window starting from this week's Monday
+  const startMonday = mondayOf(new Date().toISOString().slice(0, 10));
+  const weeks = [];
+  for (let i = 0; i < 13; i++) weeks.push(addDays(startMonday, i * 7));
+
+  // Bucket events by week
+  const byWeek = {};
+  for (const e of events) {
+    const wk = mondayOf(e.date);
+    if (!wk) continue;
+    if (!byWeek[wk]) byWeek[wk] = [];
+    byWeek[wk].push(e);
+  }
+
+  // Past events (before window start) — collapsed line
+  const pastEvents = events.filter(e => cmpDate(e.date, startMonday) < 0);
+  const futureBeyondWindow = events.filter(e => cmpDate(e.date, addDays(startMonday, 13 * 7)) >= 0);
+
+  return (
+    <SectionBox title="Project cashflow (next 13 weeks)">
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
+        Money expected from this project, week by week. All figures include VAT.
+      </div>
+      {pastEvents.length > 0 && (
+        <div style={{ fontSize: 12, color: C.muted, padding: '6px 12px', background: C.bg, borderRadius: 4, marginBottom: 10 }}>
+          {pastEvents.length} event{pastEvents.length !== 1 ? 's' : ''} before window — totalling £{fmtMoney(pastEvents.reduce((s, e) => s + e.gross, 0))}
+        </div>
+      )}
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${weeks.length}, minmax(80px, 1fr))`, gap: 4, minWidth: weeks.length * 80 }}>
+          {weeks.map(wk => (
+            <div key={wk} style={{ textAlign: 'center', fontSize: 10, color: C.muted, fontWeight: 600, paddingBottom: 4 }}>
+              {fmtDateShort(wk).replace(/, 20\d\d/, '')}
+            </div>
+          ))}
+          {weeks.map(wk => {
+            const wkEvents = byWeek[wk] || [];
+            const total = wkEvents.reduce((s, e) => s + e.gross, 0);
+            return (
+              <div key={wk + '-cell'} style={{
+                border: `1px solid ${C.line}`,
+                background: total > 0 ? C.greenLight : C.white,
+                borderRadius: 4, padding: 6, minHeight: 50,
+                fontSize: 11, fontVariantNumeric: 'tabular-nums',
+              }}>
+                {wkEvents.length === 0 ? (
+                  <div style={{ color: C.line, textAlign: 'center', marginTop: 8 }}>—</div>
+                ) : (
+                  <React.Fragment>
+                    {wkEvents.map((e, i) => (
+                      <div key={i} title={e.label} style={{
+                        color: e.source === 'retention' ? C.prussian : C.text,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                        fontWeight: 500,
+                      }}>
+                        £{fmtMoney(e.gross)}
+                      </div>
+                    ))}
+                    {wkEvents.length > 1 && (
+                      <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 3, paddingTop: 2, fontWeight: 700, color: C.green }}>
+                        £{fmtMoney(total)}
+                      </div>
+                    )}
+                  </React.Fragment>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {futureBeyondWindow.length > 0 && (
+        <div style={{ fontSize: 12, color: C.muted, padding: '6px 12px', background: C.bg, borderRadius: 4, marginTop: 10 }}>
+          {futureBeyondWindow.length} event{futureBeyondWindow.length !== 1 ? 's' : ''} after window — totalling £{fmtMoney(futureBeyondWindow.reduce((s, e) => s + e.gross, 0))}
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// ASSIGNEES SECTION (editor only)
+// ============================================================
+function AssigneesSection({ project, assignees, setAssignees, allUsers, access, showFlash, reloadAssignees }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // For displaying assignee email/name, we need allUsers loaded
+  const assigneeRows = (assignees || []).map(a => {
+    const u = (allUsers || []).find(x => x.user_id === a.user_id);
+    return { ...a, email: u ? u.email : '(unknown)', display_name: u ? u.display_name : null, role: u ? u.role : null };
+  });
+
+  const eligibleUsers = (allUsers || []).filter(u =>
+    !(assignees || []).some(a => a.user_id === u.user_id)
+  );
+
+  const add = async (userId) => {
+    setBusy(true);
+    try {
+      const inserted = await sbInsert('project_contributors', [{
+        project_id: project.id, user_id: userId,
+        added_by_email: getEmail(access.session),
+      }], access.session);
+      // Log on project audit
+      const target = allUsers.find(u => u.user_id === userId);
+      await sbUpdate('projects', `id=eq.${project.id}`, {
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: 'assignee_added', actor: getEmail(access.session), at: new Date().toISOString(), target: target ? target.email : userId },
+        ],
+      }, access.session);
+      setAssignees([...(assignees || []), inserted[0]]);
+      setPickerOpen(false);
+      showFlash('ok', `Added ${target ? target.email : 'user'} to project.`);
+    } catch (e) { showFlash('err', 'Could not add: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (userId) => {
+    setBusy(true);
+    try {
+      await sbDelete('project_contributors', `project_id=eq.${project.id}&user_id=eq.${userId}`, access.session);
+      const target = (allUsers || []).find(u => u.user_id === userId);
+      await sbUpdate('projects', `id=eq.${project.id}`, {
+        audit_log: [
+          ...(Array.isArray(project.audit_log) ? project.audit_log : []),
+          { event: 'assignee_removed', actor: getEmail(access.session), at: new Date().toISOString(), target: target ? target.email : userId },
+        ],
+      }, access.session);
+      setAssignees((assignees || []).filter(a => a.user_id !== userId));
+      showFlash('ok', 'Removed.');
+    } catch (e) { showFlash('err', 'Could not remove: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <SectionBox
+      title="Assignees"
+      actions={
+        <button
+          onClick={() => setPickerOpen(o => !o)}
+          disabled={busy || eligibleUsers.length === 0}
+          style={miniBtn()}
+        >
+          + Add user
+        </button>
+      }
+    >
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
+        Users assigned here can view and edit this project. Editors implicitly have access to all projects.
+      </div>
+      {pickerOpen && (
+        <div style={{ marginBottom: 12, padding: 12, background: C.bg, borderRadius: 6 }}>
+          <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Pick a user to assign
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 6 }}>
+            {eligibleUsers.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.muted }}>Everyone is already assigned.</div>
+            ) : eligibleUsers.map(u => (
+              <button
+                key={u.user_id}
+                onClick={() => add(u.user_id)}
+                disabled={busy}
+                style={{
+                  ...btnGhost(), padding: '8px 10px', fontSize: 12,
+                  textAlign: 'left', justifyContent: 'flex-start',
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>{u.display_name || u.email}</div>
+                {u.display_name && <div style={{ fontSize: 10, color: C.muted, fontWeight: 400 }}>{u.email}</div>}
+                <div style={{ fontSize: 10, color: u.role === 'editor' ? C.red : C.prussian, fontWeight: 600, marginTop: 2 }}>
+                  {u.role === 'editor' ? 'Editor' : 'Contributor'}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {assigneeRows.length === 0 ? (
+        <div style={{ padding: 16, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
+          No one assigned yet.
+        </div>
+      ) : (
+        <div>
+          {assigneeRows.map(a => (
+            <div key={a.user_id} style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '8px 10px', borderBottom: `1px solid ${C.line}`,
+            }}>
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{a.display_name || a.email}</div>
+                  {a.display_name && <div style={{ fontSize: 11, color: C.muted }}>{a.email}</div>}
+                </div>
+                {a.role && (
+                  <span style={{
+                    background: a.role === 'editor' ? C.redLight : C.prussianLight,
+                    color: a.role === 'editor' ? C.red : C.prussian,
+                    padding: '2px 8px', borderRadius: 8, fontSize: 10, fontWeight: 600,
+                  }}>{a.role === 'editor' ? 'Editor' : 'Contributor'}</span>
+                )}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted }}>
+                Added {timeAgo(a.added_at)}
+                <button onClick={() => remove(a.user_id)} disabled={busy} style={{ ...miniBtn(), marginLeft: 12, color: C.redStatus }}>
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// AUDIT LOG SECTION — last 10 + expand
+// ============================================================
+const AUDIT_EVENT_LABELS = {
+  created:           'Project created',
+  activated:         'Activated',
+  status_changed:    'Status changed',
+  archived:          'Archived',
+  unarchived:        'Un-archived',
+  assignee_added:    'Assignee added',
+  assignee_removed:  'Assignee removed',
+  header_edited:     'Header edited',
+  schedule_edited:   'Schedule edited',
+  retention_edited:  'Retention releases edited',
+};
+
+function AuditLogSection({ project }) {
+  const [showAll, setShowAll] = useState(false);
+  const log = Array.isArray(project.audit_log) ? project.audit_log : [];
+  // Newest first
+  const sorted = [...log].sort((a, b) => cmpDate(b.at, a.at) || (b.at || '').localeCompare(a.at || ''));
+  const visible = showAll ? sorted : sorted.slice(0, 10);
+
+  return (
+    <SectionBox title="Activity">
+      {sorted.length === 0 ? (
+        <div style={{ padding: 16, textAlign: 'center', color: C.muted, fontSize: 13 }}>No activity yet.</div>
+      ) : (
+        <React.Fragment>
+          <div>
+            {visible.map((ev, i) => (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'flex-start', gap: 10,
+                padding: '8px 0', borderBottom: i === visible.length - 1 ? 'none' : `1px solid ${C.line}`,
+                fontSize: 13,
+              }}>
+                <div style={{ width: 6, height: 6, borderRadius: 3, background: C.red, marginTop: 6, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600 }}>
+                    {AUDIT_EVENT_LABELS[ev.event] || ev.event}
+                    {ev.from && ev.to && <span style={{ color: C.muted, fontWeight: 400 }}> — {ev.from} → {ev.to}</span>}
+                    {ev.target && <span style={{ color: C.muted, fontWeight: 400 }}> — {ev.target}</span>}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                    {ev.actor || 'unknown'} · {fmtDate(ev.at)}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {sorted.length > 10 && (
+            <div style={{ textAlign: 'center', marginTop: 12 }}>
+              <button onClick={() => setShowAll(s => !s)} style={btnGhost()}>
+                {showAll ? `Show last 10` : `Show all ${sorted.length} events`}
+              </button>
+            </div>
+          )}
+        </React.Fragment>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// SECTION BOX — consistent wrapper for project page sections
+// ============================================================
+function SectionBox({ title, actions, children }) {
+  return (
+    <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, marginBottom: 16, overflow: 'hidden' }}>
+      <div style={{
+        padding: '10px 18px', background: C.bg, borderBottom: `1px solid ${C.line}`,
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+          {title}
+        </div>
+        {actions && <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>{actions}</div>}
+      </div>
+      <div style={{ padding: 18 }}>
+        {children}
+      </div>
+    </div>
+  );
+}
 function DebtorListStub()               { return <StubPage title="Debtors" subtitle="Imported from CSV or added manually.">Debtor list — Stage 6.</StubPage>; }
 function DebtorImportStub()             { return <StubPage title="Import debtors" subtitle="Upload CSV, map columns, review, commit.">CSV import — Stage 6.</StubPage>; }
 function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
@@ -1028,6 +2293,7 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
     number:            project ? (project.number || '') : '',
     value:             project ? project.value : '',
     retention_pct:     project ? project.retention_pct : '',
+    defects_retention_pct: project && project.defects_retention_pct != null ? project.defects_retention_pct : '',
     start_date:        project ? (project.start_date || '') : '',
     end_date:          project ? (project.end_date || '') : '',
     retention_date:    project ? (project.retention_date || '') : '',
@@ -1041,6 +2307,11 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
   // category errors — hard blocks on save.
   const endBeforeStart = form.start_date && form.end_date && cmpDate(form.end_date, form.start_date) < 0;
   const retentionBeforeEnd = form.end_date && form.retention_date && cmpDate(form.retention_date, form.end_date) < 0;
+
+  // Soft: defects retention shouldn't exceed total retention (warn, don't block).
+  const defectsExceedsRetention =
+    form.defects_retention_pct !== '' && form.retention_pct !== ''
+    && Number(form.defects_retention_pct) > Number(form.retention_pct);
 
   const valid =
     form.name && form.name.trim().length > 0
@@ -1059,6 +2330,7 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
         number: form.number.trim() || null,
         value: Number(form.value) || 0,
         retention_pct: form.retention_pct === '' ? 0 : Number(form.retention_pct),
+        defects_retention_pct: form.defects_retention_pct === '' ? null : Number(form.defects_retention_pct),
         start_date: form.start_date || null,
         end_date: form.end_date || null,
         retention_date: form.retention_date || null,
@@ -1105,12 +2377,25 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
         </Field>
       </div>
 
-      <div style={twoCol()}>
+      <div style={threeCol()}>
         <Field label="Project value (£)">
           <MoneyInput value={form.value} onChange={(v) => update('value', v)} />
         </Field>
         <Field label="Retention (%)">
           <NumberInput value={form.retention_pct} onChange={(v) => update('retention_pct', v)} step="0.01" placeholder="e.g. 5" />
+        </Field>
+        <Field label="Defects retention (%)">
+          <NumberInput value={form.defects_retention_pct} onChange={(v) => update('defects_retention_pct', v)} step="0.01" placeholder="optional, e.g. 2.5" />
+          {defectsExceedsRetention && (
+            <div style={{ fontSize: 11, color: C.amber, marginTop: 3, fontWeight: 500 }}>
+              ⚠ Defects retention exceeds total retention
+            </div>
+          )}
+          {!defectsExceedsRetention && (
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 3, fontStyle: 'italic' }}>
+              Part of retention held past defects period. Often half of total.
+            </div>
+          )}
         </Field>
       </div>
 
