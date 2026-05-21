@@ -1128,6 +1128,40 @@ function CashflowPage({ access }) {
     return <span style={style}>{children}</span>;
   };
 
+  // Cell-tint palette per event source (green = invoice, amber = retention,
+  // prussian = debtor). For mixed cells we pick the colour of whichever event
+  // type contributes the largest absolute £ amount to the cell total.
+  //
+  // Absolute value matters because a small +£10k invoice mixed with a -£1k
+  // debtor credit shouldn't flip the cell's identity — invoice is still the
+  // dominant signal.
+  const tintForEvents = (events) => {
+    if (!events || events.length === 0) return 'transparent';
+    const totals = { invoice: 0, retention: 0, debtor: 0 };
+    for (const ev of events) {
+      const key = ev.source === 'retention' ? 'retention'
+                : ev.source === 'debtor'    ? 'debtor'
+                : 'invoice';
+      totals[key] += Math.abs(Number(ev.gross) || 0);
+    }
+    // Pick the dominant source
+    let dominant = 'invoice', best = -1;
+    for (const k of Object.keys(totals)) {
+      if (totals[k] > best) { best = totals[k]; dominant = k; }
+    }
+    if (dominant === 'retention') return C.amberLight;
+    if (dominant === 'debtor')    return C.prussianLight;
+    return C.greenLight;
+  };
+
+  // Text colour for a cell value. Negative amounts (money owed BY Arke, e.g.
+  // credit balances from over-payments or refunds) display in red so they stand
+  // out on the grid as a liability, not income.
+  const textColorForValue = (n, fallback) => {
+    if (n != null && Number(n) < 0) return C.redStatus;
+    return fallback || C.text;
+  };
+
   // Month-strip data: groups of consecutive weeks that share a month.
   // Used as a row of headers above the per-week headers at compact/tight zooms.
   // Plain const (not useMemo) — this can't be a hook because it's after early
@@ -1208,6 +1242,24 @@ function CashflowPage({ access }) {
             </div>
           }
         >
+          {/* Legend — explains the cell tint scheme */}
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center',
+            padding: '8px 12px', marginBottom: 10, background: C.bg,
+            border: `1px solid ${C.line}`, borderRadius: 6,
+            fontSize: 11, color: C.muted,
+          }}>
+            <span style={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Legend:
+            </span>
+            <LegendSwatch colour={C.greenLight} label="Invoice payment" />
+            <LegendSwatch colour={C.amberLight} label="Retention release" />
+            <LegendSwatch colour={C.prussianLight} label="Debtor (predicted)" />
+            <span style={{ color: C.muted, fontStyle: 'italic' }}>
+              Mixed cells take the colour of the largest contributor · negative figures shown in red
+            </span>
+          </div>
+
           {grid.pastTotal > 0 && (
             <div style={{ fontSize: 12, color: C.muted, padding: '6px 10px', background: C.bg, borderRadius: 4, marginBottom: 10 }}>
               {Object.values(grid.perProject).reduce((s, r) => s + (r.past > 0 ? 1 : 0), 0)} project{Object.values(grid.perProject).filter(r => r.past > 0).length === 1 ? ' has' : 's have'} cash events before the window — totalling £{fmtMoney(grid.pastTotal)}
@@ -1321,19 +1373,17 @@ function CashflowPage({ access }) {
                           onClick={hasEvents ? () => openDrill(wk, p.name, cell.events) : undefined}
                           disabled={!hasEvents}
                           style={{
-                            border: 'none', background: hasEvents ? C.greenLight : 'transparent',
+                            border: 'none',
+                            background: hasEvents ? tintForEvents(cell.events) : 'transparent',
                             cursor: hasEvents ? 'pointer' : 'default',
                             padding: zoomConfig.rotated ? '6px 0' : '8px 4px',
                             fontFamily: 'inherit',
                             fontSize: zoomConfig.fontSize,
-                            color: hasEvents ? C.text : C.line,
+                            color: hasEvents ? textColorForValue(cell.total) : C.line,
                             fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
                             borderRight: `1px solid ${C.line}`,
                             overflow: 'hidden',
                             minWidth: 0,
-                            // Rotated cells use flex centring so the rotated text
-                            // sits in the centre of the cell. Horizontal cells use
-                            // text-align right to match the £ convention.
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
@@ -1348,7 +1398,7 @@ function CashflowPage({ access }) {
                     })}
                     <div style={{
                       padding: zoomConfig.rotated ? '6px 0' : '8px 6px',
-                      fontWeight: 700, color: C.text,
+                      fontWeight: 700, color: textColorForValue(row.rowTotal),
                       background: C.bg, fontSize: zoomConfig.fontSize,
                       overflow: 'hidden', minWidth: 0,
                       display: 'flex',
@@ -1371,12 +1421,12 @@ function CashflowPage({ access }) {
                   borderBottom: `1px solid ${C.line}`,
                   fontVariantNumeric: 'tabular-nums',
                   minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
-                  background: C.amberLight,
                 }}>
                   <div style={{
                     padding: '8px', overflow: 'hidden', minWidth: 0,
                     borderRight: `3px solid ${C.red}`,
                     display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                    background: C.amberLight,
                   }}>
                     <a href={buildHash(['debtors'])} style={{
                       color: C.amber, fontWeight: 700, textDecoration: 'none',
@@ -1397,12 +1447,13 @@ function CashflowPage({ access }) {
                         onClick={hasEvents ? () => openDrill(wk, 'Other debtors', cell.events) : undefined}
                         disabled={!hasEvents}
                         style={{
-                          border: 'none', background: hasEvents ? C.amberLight : 'transparent',
+                          border: 'none',
+                          background: hasEvents ? C.prussianLight : 'transparent',
                           cursor: hasEvents ? 'pointer' : 'default',
                           padding: zoomConfig.rotated ? '6px 0' : '8px 4px',
                           fontFamily: 'inherit',
                           fontSize: zoomConfig.fontSize,
-                          color: hasEvents ? C.text : C.line,
+                          color: hasEvents ? textColorForValue(cell.total) : C.line,
                           fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
                           borderRight: `1px solid ${C.line}`,
                           overflow: 'hidden', minWidth: 0,
@@ -1420,7 +1471,7 @@ function CashflowPage({ access }) {
                   })}
                   <div style={{
                     padding: zoomConfig.rotated ? '6px 0' : '8px 6px',
-                    fontWeight: 700, color: C.text,
+                    fontWeight: 700, color: textColorForValue(grid.unmatched.rowTotal),
                     background: C.bg, fontSize: zoomConfig.fontSize,
                     overflow: 'hidden', minWidth: 0,
                     display: 'flex',
@@ -1450,7 +1501,7 @@ function CashflowPage({ access }) {
                 {weekColumns.map(wk => (
                   <div key={wk} style={{
                     padding: zoomConfig.rotated ? '6px 0' : '10px 4px',
-                    color: C.text,
+                    color: textColorForValue(grid.weekTotals[wk] || 0),
                     borderRight: `1px solid ${C.line}`,
                     overflow: 'hidden', minWidth: 0,
                     fontSize: zoomConfig.fontSize,
@@ -1464,7 +1515,7 @@ function CashflowPage({ access }) {
                 ))}
                 <div style={{
                   padding: zoomConfig.rotated ? '6px 0' : '10px 6px',
-                  color: C.green,
+                  color: textColorForValue(grid.grandTotal, C.green),
                   fontSize: zoomConfig.fontSize,
                   overflow: 'hidden', minWidth: 0,
                   display: 'flex', alignItems: 'center',
@@ -1512,7 +1563,7 @@ function CashflowPage({ access }) {
                 ))}
                 <div style={{
                   padding: zoomConfig.rotated ? '6px 0' : '10px 6px',
-                  color: C.prussian,
+                  color: textColorForValue(runningBalance[runningBalance.length - 1], C.prussian),
                   fontSize: zoomConfig.fontSize,
                   overflow: 'hidden', minWidth: 0,
                   display: 'flex', alignItems: 'center',
@@ -1635,6 +1686,18 @@ function WindowPicker({ value, onChange }) {
         </button>
       ))}
     </div>
+  );
+}
+
+function LegendSwatch({ colour, label }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: C.text }}>
+      <span style={{
+        width: 14, height: 14, background: colour,
+        border: `1px solid ${C.line}`, borderRadius: 3, display: 'inline-block',
+      }} />
+      <span style={{ fontSize: 11, fontWeight: 600 }}>{label}</span>
+    </span>
   );
 }
 
@@ -4155,7 +4218,7 @@ function DebtorImportModal({ access, projects, existingDebtors, onClose, onCompl
 
         <div style={{ maxHeight: '50vh', overflowY: 'auto', border: `1px solid ${C.line}`, borderRadius: 6 }}>
           <div style={{
-            display: 'grid', gridTemplateColumns: '1.6fr 0.9fr 1.5fr',
+            display: 'grid', gridTemplateColumns: '1.5fr 130px 1.5fr', gap: 16,
             padding: '8px 10px', background: C.bg,
             fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
             borderBottom: `1px solid ${C.line}`, position: 'sticky', top: 0,
@@ -4168,13 +4231,13 @@ function DebtorImportModal({ access, projects, existingDebtors, onClose, onCompl
             const isMatched = !!matches[r.contact];
             return (
               <div key={i} style={{
-                display: 'grid', gridTemplateColumns: '1.6fr 0.9fr 1.5fr',
+                display: 'grid', gridTemplateColumns: '1.5fr 130px 1.5fr', gap: 16,
                 padding: '8px 10px', borderBottom: i === parsed.rows.length - 1 ? 'none' : `1px solid ${C.line}`,
                 alignItems: 'center',
                 background: isMatched ? 'transparent' : C.amberLight,
               }}>
                 <div style={{ fontSize: 13, fontWeight: 600 }}>{r.contact}</div>
-                <div style={{ fontSize: 13, fontVariantNumeric: 'tabular-nums', textAlign: 'right' }}>
+                <div style={{ fontSize: 13, fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
                   £{fmtMoney(r.total)}
                 </div>
                 <select
