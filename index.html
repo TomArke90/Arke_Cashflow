@@ -1027,7 +1027,10 @@ function CashflowPage({ access }) {
       rotated: true, rowHeight: 96, fontSize: 12,
     } :
     /* 52w */         {
-      projectCol: 180, totalCol: 90, weekMin: 22,
+      // Calibrated to fit ~1240px wide: 170 + 52×20 + 30 = 1240.
+      // The total column rotates too at this zoom, so it can be narrow like the
+      // week cells.
+      projectCol: 170, totalCol: 30, weekMin: 20,
       rotated: true, rowHeight: 96, fontSize: 11,
     };
 
@@ -1218,9 +1221,12 @@ function CashflowPage({ access }) {
                   </div>
                 ))}
                 <div style={{
-                  textAlign: 'right', padding: '0 8px', fontSize: 11,
-                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
-                }}>Total</div>
+                  padding: zoomConfig.rotated ? '4px 0' : '0 8px',
+                  fontSize: 11,
+                  display: 'flex',
+                  alignItems: zoomConfig.rotated ? 'flex-end' : 'flex-end',
+                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                }}><CellText>Total</CellText></div>
               </div>
 
               {/* Project rows */}
