@@ -819,7 +819,7 @@ function Sidebar({ isEditor, route, navigate, access }) {
           gets squeezed out of view, even when nav content is tall. */}
       <div style={{
         borderTop: '1px solid rgba(255,255,255,0.2)',
-        padding: '14px 20px 20px', marginTop: 8,
+        padding: '14px 20px 32px', marginTop: 8,
         flexShrink: 0,
       }}>
         <div style={{ fontSize: 11, color: C.white, opacity: 0.7, marginBottom: 2 }}>Signed in as</div>
@@ -2505,13 +2505,19 @@ function PnLTable({ pnlGrid, pnlPeriods, moneyInOpen, setMoneyInOpen, moneyOutOp
   const PnLCell = ({ value, bold, background, textColor }) => {
     const isZero = !value || Number(value) === 0;
     const display = isZero ? '—' : `£${fmtMoney(value)}`;
+    // Negative-red always wins over the row's accent textColor, so the
+    // Movement row (carmine-themed) correctly switches to black for positive
+    // values and red for negative — without losing the row's tinted bg.
+    const colour = isZero ? C.line
+      : Number(value) < 0 ? C.redStatus
+      : (textColor || C.text);
     return (
       <div style={{
         padding: '10px 12px',
         textAlign: 'right',
         fontSize: 13,
         fontWeight: bold ? 700 : 500,
-        color: isZero ? C.line : (textColor || (Number(value) < 0 ? C.redStatus : C.text)),
+        color: colour,
         background: background || 'transparent',
         fontVariantNumeric: 'tabular-nums',
         borderRight: `1px solid ${C.line}`,
@@ -4487,12 +4493,25 @@ function AuditLogSection({ project }) {
 // ============================================================
 function SectionBox({ title, actions, children }) {
   return (
-    <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 8, marginBottom: 16, overflow: 'hidden' }}>
+    <div style={{
+      background: C.white,
+      border: `1px solid ${C.line}`,
+      borderRadius: 8,
+      marginBottom: 18,
+      overflow: 'hidden',
+      // Subtle shadow lifts the section card off the page background
+      boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+    }}>
       <div style={{
-        padding: '10px 18px', background: C.bg, borderBottom: `1px solid ${C.line}`,
+        padding: '14px 20px',
+        background: C.redSoft,
+        borderBottom: `2px solid ${C.red}`,
         display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
       }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+        <div style={{
+          fontSize: 14, fontWeight: 700, color: C.red,
+          textTransform: 'uppercase', letterSpacing: '0.06em',
+        }}>
           {title}
         </div>
         {actions && <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>{actions}</div>}
@@ -5558,6 +5577,9 @@ function OverheadsPage({ access }) {
   }
 
   const totalRunRate = overheads.reduce((s, o) => s + monthlyRunRate(o), 0);
+  const totalAnnual = totalRunRate * 12;
+  const recurringCount = overheads.filter(o => o.frequency !== 'once').length;
+  const oneOffCount = overheads.length - recurringCount;
 
   return (
     <div style={{ maxWidth: 1400 }}>
@@ -5566,7 +5588,7 @@ function OverheadsPage({ access }) {
           <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Overheads</h1>
           <div style={{ fontSize: 13, color: C.muted }}>
             {overheads.length} overhead{overheads.length === 1 ? '' : 's'} ·
-            £{fmtMoney(totalRunRate)}/month run-rate (recurring only)
+            {' '}{recurringCount} recurring · {oneOffCount} one-off
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
@@ -5578,6 +5600,39 @@ function OverheadsPage({ access }) {
           </button>
         </div>
       </div>
+
+      {/* Headline total — sits above the per-category breakdown to give an
+          at-a-glance read of total run-rate cost. Annualised for context. */}
+      {overheads.length > 0 && (
+        <div style={{
+          background: C.white, border: `1px solid ${C.line}`, borderRadius: 8,
+          padding: '18px 22px', marginBottom: 20,
+          display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24,
+        }}>
+          <div>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+              Total monthly run-rate
+            </div>
+            <div style={{ fontSize: 28, fontWeight: 700, color: C.red, fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.01em' }}>
+              £{fmtMoney(totalRunRate)}
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+              Recurring overheads only · excludes one-off costs
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+              Annualised
+            </div>
+            <div style={{ fontSize: 28, fontWeight: 700, color: C.text, fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.01em' }}>
+              £{fmtMoney(totalAnnual)}
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+              Monthly run-rate × 12
+            </div>
+          </div>
+        </div>
+      )}
 
       {overheads.length === 0 ? (
         <SectionBox title="No overheads yet">
@@ -6202,6 +6257,13 @@ function ProjectsRegisterPage({ access, navigate }) {
 
   const visible = showArchived ? rows : rows.filter(r => r.status !== 'archived');
   const archivedCount = rows.filter(r => r.status === 'archived').length;
+  // Active total = sum of value across all non-archived projects (this is the
+  // "in-flight commercial portfolio" number — archived/closed projects don't
+  // count, regardless of whether they're currently visible in the list).
+  const activeTotal = rows
+    .filter(r => r.status !== 'archived')
+    .reduce((s, r) => s + (Number(r.value) || 0), 0);
+  const activeCount = rows.filter(r => r.status !== 'archived').length;
 
   return (
     <div style={{ maxWidth: 1400 }}>
@@ -6210,7 +6272,7 @@ function ProjectsRegisterPage({ access, navigate }) {
           <h1 style={brandTitle()}>{isEditor ? 'Projects' : 'My projects'}</h1>
           <p style={{ color: C.muted, fontSize: 14, margin: 0 }}>
             {isEditor
-              ? 'All projects in the register.'
+              ? `${activeCount} active project${activeCount === 1 ? '' : 's'} · £${fmtMoney(activeTotal)} total value`
               : 'Projects you’ve been assigned to.'}
           </p>
         </div>
@@ -6257,6 +6319,31 @@ function ProjectsRegisterPage({ access, navigate }) {
             <div style={{ textAlign: 'right' }}>Updated</div>
           </div>
           {visible.map(r => <ProjectRegisterRow key={r.id} row={r} isEditor={isEditor} />)}
+
+          {/* Footer total row — sums only non-archived projects, regardless of
+              whether archived projects are currently shown in the list. */}
+          {isEditor && (
+            <div style={{
+              display: 'grid', gridTemplateColumns: '2.2fr 1fr 1.1fr 0.8fr 1.1fr 0.7fr',
+              gap: 12, padding: '14px 18px', background: C.bg,
+              borderTop: `2px solid ${C.red}`,
+              fontSize: 13, fontWeight: 700, color: C.text,
+              alignItems: 'center',
+            }}>
+              <div style={{ textTransform: 'uppercase', letterSpacing: '0.04em', fontSize: 11, color: C.muted }}>
+                Active total{showArchived && archivedCount > 0 ? ' (archived excluded)' : ''}
+              </div>
+              <div></div>
+              <div style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                £{fmtMoney(activeTotal)}
+              </div>
+              <div></div>
+              <div style={{ fontSize: 11, color: C.muted, fontWeight: 500 }}>
+                {activeCount} project{activeCount === 1 ? '' : 's'}
+              </div>
+              <div></div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -7748,7 +7835,7 @@ function SettingsHub({ access }) {
     <div style={{ maxWidth: 720 }}>
       <h1 style={brandTitle()}>Settings</h1>
       <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 24 }}>
-        Manage users, overhead categories, and CSV import presets.
+        Manage users and overhead categories.
       </p>
       <div style={{ display: 'grid', gap: 12, gridTemplateColumns: '1fr 1fr', maxWidth: 600 }}>
         <SettingsCard
