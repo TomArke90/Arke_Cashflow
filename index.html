@@ -1008,46 +1008,37 @@ function CashflowPage({ access }) {
     XLSX.writeFile(wb, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
-  // Zoom-aware sizing.
+  // Zoom-aware layout.
   //
-  // Calibrated so the canonical "£28,500" (full) or "£28.5k" (abbreviated) fits
-  // comfortably in each tier without truncation. Reference: at 11px tabular-nums,
-  // one digit ≈ 6.5px, so "£28,500" needs ~46px text + 4px padding × 2 = ~54px cell.
+  // 13w (horizontal): cells laid out normally, full pounds-and-pence visible.
+  // 26w / 52w (rotated): cell content rotates 90° counter-clockwise (bottom-to-top)
+  // so amounts grow downward instead of squeezing horizontally. Width per cell can
+  // shrink dramatically because we only need the text height to fit horizontally.
+  // Row height grows to accommodate the rotated text.
   //
-  // Tiers:
-  //   13w (full):   £28,500 — full grouped integer
-  //   26w (k1):     £28.5k  — abbreviated to thousands, 1 decimal under 100k
-  //   52w (k0):     £29k    — abbreviated to thousands, rounded
+  // No abbreviations — pounds and pence are visible at every zoom level.
   const zoomConfig =
-    windowWeeks <= 13 ? { projectCol: 200, totalCol: 100, weekMin: 60, fmt: 'full',    fontSize: 11 } :
-    windowWeeks <= 26 ? { projectCol: 180, totalCol: 90,  weekMin: 44, fmt: 'k1',      fontSize: 11 } :
-    /* 52w */         { projectCol: 160, totalCol: 80,  weekMin: 30, fmt: 'k0',      fontSize: 10 };
+    windowWeeks <= 13 ? {
+      projectCol: 220, totalCol: 110, weekMin: 80,
+      rotated: false, rowHeight: null, fontSize: 12,
+    } :
+    windowWeeks <= 26 ? {
+      projectCol: 200, totalCol: 100, weekMin: 26,
+      rotated: true, rowHeight: 96, fontSize: 12,
+    } :
+    /* 52w */         {
+      projectCol: 180, totalCol: 90, weekMin: 22,
+      rotated: true, rowHeight: 96, fontSize: 11,
+    };
 
   const gridCols = `${zoomConfig.projectCol}px repeat(${weekColumns.length}, minmax(${zoomConfig.weekMin}px, 1fr)) ${zoomConfig.totalCol}px`;
   // Minimum width before the horizontal scroll kicks in (when window narrower than this)
   const gridMinWidth = zoomConfig.projectCol + (weekColumns.length * zoomConfig.weekMin) + zoomConfig.totalCol;
 
-  // Cell amount formatter — sized to fit the zoomConfig tier exactly.
+  // Cell amount formatter — always shows full pounds with decimals when non-round.
+  // No abbreviation; rotation handles fitting at tight zooms.
   const fmtCellAmount = (n) => {
     if (n == null || n === 0) return '—';
-    const abs = Math.abs(n);
-    if (zoomConfig.fmt === 'k0') {
-      // 52w: always abbreviate to whole thousands. Sub-1k stays as a small integer.
-      if (abs >= 1000) return `£${Math.round(n / 1000)}k`;
-      return `£${Math.round(n)}`;
-    }
-    if (zoomConfig.fmt === 'k1') {
-      // 26w: abbreviate to thousands with 1 decimal under 100k, 0 above.
-      if (abs >= 1000) {
-        const k = n / 1000;
-        if (abs >= 100000) return `£${Math.round(k)}k`;
-        // strip trailing .0
-        const v = k.toFixed(1);
-        return `£${v.endsWith('.0') ? v.slice(0, -2) : v}k`;
-      }
-      return `£${Math.round(n)}`;
-    }
-    // 'full' (13w): grouped integer with no decimals if round, else 2dp
     const rounded = Math.round(n);
     if (Math.abs(n - rounded) < 0.005) {
       return `£${rounded.toLocaleString('en-GB')}`;
@@ -1055,28 +1046,44 @@ function CashflowPage({ access }) {
     return `£${fmtMoney(n)}`;
   };
 
-  // Column-header formatter. At tighter zooms drop the month, show day-of-month only
-  // (the month-strip above headers shows the month).
+  // Column-header formatter. At rotated zooms, headers also rotate (handled by
+  // the parent cell style), so show full date "DD MMM". At horizontal mode show
+  // "DD Mmm" (no year — month strip handles year separation).
   const fmtWeekHeader = (wk) => {
-    if (zoomConfig.fmt === 'k0') {
-      const d = new Date(wk + 'T00:00:00Z');
-      return String(d.getUTCDate());
-    }
-    if (zoomConfig.fmt === 'k1') {
+    if (zoomConfig.rotated) {
       const d = new Date(wk + 'T00:00:00Z');
       return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
     }
     return fmtDateShort(wk).replace(/, 20\d\d/, '');
   };
 
-  const isAbbrev = zoomConfig.fmt !== 'full';
+  // Style for a rotated text container. The trick: wrap an inline-block that is
+  // visually rotated. transform-origin: center keeps it centred in the cell.
+  // writing-mode: vertical-rl + transform: rotate(180deg) gives bottom-to-top
+  // text. We use whiteSpace: 'nowrap' so the rotated string doesn't wrap.
+  const rotatedTextStyle = {
+    writingMode: 'vertical-rl',
+    transform: 'rotate(180deg)',
+    whiteSpace: 'nowrap',
+    display: 'inline-block',
+  };
+
+  // Helper that returns either the rotated wrapper or a plain span based on zoom.
+  const CellText = ({ children, style }) => {
+    if (zoomConfig.rotated) {
+      return <span style={{ ...rotatedTextStyle, ...(style || {}) }}>{children}</span>;
+    }
+    return <span style={style}>{children}</span>;
+  };
 
   // Month-strip data: groups of consecutive weeks that share a month.
   // Used as a row of headers above the per-week headers at compact/tight zooms.
   // Plain const (not useMemo) — this can't be a hook because it's after early
   // returns above. It's also cheap enough to recompute each render.
   const monthGroups = (() => {
-    if (zoomConfig.fmt === 'full') return null;
+    // Month strip only appears at rotated zooms; at 13w the week headers already
+    // include the month abbreviation so a separate strip is redundant.
+    if (!zoomConfig.rotated) return null;
     const groups = [];
     let current = null;
     for (let i = 0; i < weekColumns.length; i++) {
@@ -1190,20 +1197,30 @@ function CashflowPage({ access }) {
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: gridCols,
-                fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
+                color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
                 padding: '8px 0', borderBottom: `2px solid ${C.line}`,
+                minHeight: zoomConfig.rotated ? 88 : undefined,
               }}>
-                <div style={{ padding: '0 8px', borderRight: `3px solid ${C.red}` }}>Project</div>
+                <div style={{
+                  padding: '0 8px', borderRight: `3px solid ${C.red}`,
+                  fontSize: 11, display: 'flex', alignItems: 'flex-end',
+                }}>Project</div>
                 {weekColumns.map(wk => (
                   <div key={wk} style={{
-                    textAlign: isAbbrev ? 'center' : 'right',
-                    padding: '0 4px',
+                    display: 'flex',
+                    alignItems: zoomConfig.rotated ? 'flex-end' : 'center',
+                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                    padding: zoomConfig.rotated ? '4px 0' : '0 4px',
                     fontSize: zoomConfig.fontSize,
+                    minWidth: 0, overflow: 'hidden',
                   }}>
-                    {fmtWeekHeader(wk)}
+                    <CellText>{fmtWeekHeader(wk)}</CellText>
                   </div>
                 ))}
-                <div style={{ textAlign: 'right', padding: '0 8px' }}>Total</div>
+                <div style={{
+                  textAlign: 'right', padding: '0 8px', fontSize: 11,
+                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
+                }}>Total</div>
               </div>
 
               {/* Project rows */}
@@ -1215,12 +1232,16 @@ function CashflowPage({ access }) {
                     gridTemplateColumns: gridCols,
                     borderBottom: `1px solid ${C.line}`,
                     fontVariantNumeric: 'tabular-nums',
+                    minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
                   }}>
-                    <div style={{ padding: '8px', overflow: 'hidden', minWidth: 0, borderRight: `3px solid ${C.red}` }}>
+                    <div style={{
+                      padding: '8px', overflow: 'hidden', minWidth: 0,
+                      borderRight: `3px solid ${C.red}`,
+                      display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                    }}>
                       <a href={buildHash(['projects', p.id])} style={{
                         color: C.text, fontWeight: 600, textDecoration: 'none',
                         fontSize: 13,
-                        // Two-line wrap with ellipsis on overflow
                         display: '-webkit-box',
                         WebkitLineClamp: 2,
                         WebkitBoxOrient: 'vertical',
@@ -1247,69 +1268,85 @@ function CashflowPage({ access }) {
                           style={{
                             border: 'none', background: hasEvents ? C.greenLight : 'transparent',
                             cursor: hasEvents ? 'pointer' : 'default',
-                            textAlign: 'right',
-                            padding: '8px 4px',
+                            padding: zoomConfig.rotated ? '6px 0' : '8px 4px',
                             fontFamily: 'inherit',
                             fontSize: zoomConfig.fontSize,
                             color: hasEvents ? C.text : C.line,
                             fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
                             borderRight: `1px solid ${C.line}`,
-                            overflow: 'hidden', whiteSpace: 'nowrap',
+                            overflow: 'hidden',
                             minWidth: 0,
+                            // Rotated cells use flex centring so the rotated text
+                            // sits in the centre of the cell. Horizontal cells use
+                            // text-align right to match the £ convention.
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                           }}
                           title={hasEvents
                             ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view`
                             : ''}
                         >
-                          {fmtCellAmount(cell.total)}
+                          <CellText>{fmtCellAmount(cell.total)}</CellText>
                         </button>
                       );
                     })}
                     <div style={{
-                      padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: C.text,
+                      padding: zoomConfig.rotated ? '6px 0' : '8px 6px',
+                      fontWeight: 700, color: C.text,
                       background: C.bg, fontSize: zoomConfig.fontSize,
-                      overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                      overflow: 'hidden', minWidth: 0,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                     }}
                       title={`£${fmtMoney(row.rowTotal)}`}
                     >
-                      {fmtCellAmount(row.rowTotal)}
+                      <CellText>{fmtCellAmount(row.rowTotal)}</CellText>
                     </div>
                   </div>
                 );
               })}
 
-              {/* Carmine separator — visual break between project rows and summary rows */}
-              <div style={{ height: 4, background: C.red, marginTop: 0 }} />
-
               {/* Week totals row */}
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: gridCols,
-                background: C.redSoft,
+                background: C.redSoft, borderTop: `2px solid ${C.line}`,
                 fontWeight: 700, fontVariantNumeric: 'tabular-nums',
+                minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
               }}>
-                <div style={{ padding: '10px 8px', color: C.red, fontSize: 12, borderRight: `3px solid ${C.red}` }}>Week totals</div>
+                <div style={{
+                  padding: '10px 8px', color: C.red, fontSize: 12,
+                  borderRight: `3px solid ${C.red}`,
+                  display: 'flex', alignItems: 'center',
+                }}>Week totals</div>
                 {weekColumns.map(wk => (
                   <div key={wk} style={{
-                    padding: '10px 4px',
-                    textAlign: 'right', color: C.text,
+                    padding: zoomConfig.rotated ? '6px 0' : '10px 4px',
+                    color: C.text,
                     borderRight: `1px solid ${C.line}`,
-                    overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                    overflow: 'hidden', minWidth: 0,
                     fontSize: zoomConfig.fontSize,
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                   }}
                     title={grid.weekTotals[wk] ? `£${fmtMoney(grid.weekTotals[wk])}` : ''}
                   >
-                    {fmtCellAmount(grid.weekTotals[wk] || 0)}
+                    <CellText>{fmtCellAmount(grid.weekTotals[wk] || 0)}</CellText>
                   </div>
                 ))}
                 <div style={{
-                  padding: '10px 6px', textAlign: 'right', color: C.green,
+                  padding: zoomConfig.rotated ? '6px 0' : '10px 6px',
+                  color: C.green,
                   fontSize: zoomConfig.fontSize,
-                  overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                  overflow: 'hidden', minWidth: 0,
+                  display: 'flex', alignItems: 'center',
+                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                 }}
                   title={`£${fmtMoney(grid.grandTotal)}`}
                 >
-                  {fmtCellAmount(grid.grandTotal)}
+                  <CellText>{fmtCellAmount(grid.grandTotal)}</CellText>
                 </div>
               </div>
 
@@ -1320,8 +1357,13 @@ function CashflowPage({ access }) {
                 background: C.prussianLight,
                 fontWeight: 700, fontVariantNumeric: 'tabular-nums',
                 borderTop: `1px solid ${C.line}`,
+                minHeight: zoomConfig.rotated ? zoomConfig.rowHeight : undefined,
               }}>
-                <div style={{ padding: '10px 8px', color: C.prussian, fontSize: 12, borderRight: `3px solid ${C.red}` }}>
+                <div style={{
+                  padding: '10px 8px', color: C.prussian, fontSize: 12,
+                  borderRight: `3px solid ${C.red}`,
+                  display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                }}>
                   Running balance
                   <div style={{ fontSize: 10, fontWeight: 500, color: C.muted }}>
                     from £{fmtMoney(settings.opening_balance)} on {fmtDateShort(settings.opening_as_of_date)}
@@ -1329,26 +1371,30 @@ function CashflowPage({ access }) {
                 </div>
                 {runningBalance.map((bal, i) => (
                   <div key={i} style={{
-                    padding: '10px 4px',
-                    textAlign: 'right',
+                    padding: zoomConfig.rotated ? '6px 0' : '10px 4px',
                     color: bal < 0 ? C.redStatus : C.prussian,
                     borderRight: `1px solid ${C.line}`,
-                    overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                    overflow: 'hidden', minWidth: 0,
                     fontSize: zoomConfig.fontSize,
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                   }}
                     title={`£${fmtMoney(bal)}`}
                   >
-                    {fmtCellAmount(bal)}
+                    <CellText>{fmtCellAmount(bal)}</CellText>
                   </div>
                 ))}
                 <div style={{
-                  padding: '10px 6px', textAlign: 'right', color: C.prussian,
+                  padding: zoomConfig.rotated ? '6px 0' : '10px 6px',
+                  color: C.prussian,
                   fontSize: zoomConfig.fontSize,
-                  overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                  overflow: 'hidden', minWidth: 0,
+                  display: 'flex', alignItems: 'center',
+                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
                 }}
                   title={`£${fmtMoney(runningBalance[runningBalance.length - 1])}`}
                 >
-                  {fmtCellAmount(runningBalance[runningBalance.length - 1])}
+                  <CellText>{fmtCellAmount(runningBalance[runningBalance.length - 1])}</CellText>
                 </div>
               </div>
             </div>
