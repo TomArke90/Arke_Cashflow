@@ -323,6 +323,12 @@ function fmtDateShort(iso) {
   return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+// Round to 2 decimals — used wherever we generate money figures programmatically.
+function round2(n) {
+  if (n == null || isNaN(Number(n))) return 0;
+  return Math.round(Number(n) * 100) / 100;
+}
+
 // ============================================================
 // HASH ROUTING — new for this app
 // Path: #/projects/abc?tab=schedule  =>
@@ -417,6 +423,27 @@ function useAccessControl() {
   useEffect(() => { fetchRole(); }, [fetchRole]);
 
   return { session, setSession, ...state, refetch: fetchRole };
+}
+
+// useCashflowUsers — loads the directory of active users for picker UIs
+// (assignee dropdowns, owner pickers). Refetch on demand.
+function useCashflowUsers(session, enabled) {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState(null);
+
+  const fetch = useCallback(async () => {
+    if (!enabled || !session) return;
+    try {
+      const u = await sbSelect('cashflow_users',
+        'select=user_id,email,display_name,role,active&active=eq.true&order=display_name.asc',
+        session);
+      setUsers(u || []);
+    } catch (e) { setError(e.message); }
+  }, [session, enabled]);
+
+  useEffect(() => { fetch(); }, [fetch]);
+
+  return { users, error, refetch: fetch };
 }
 
 // ============================================================
@@ -760,15 +787,14 @@ function ProjectDetailPage({ id, access, navigate }) {
     } catch (e) { setError(e.message); }
   }, [id, access.session]);
 
-  // Editors can see the full user list (RLS allows). Contributors don't need it
-  // — they can't see the assignees section anyway.
+  // Directory read is allowed for anyone in cashflow_users (cu_directory_read).
+  // Needed so we can display contributor names in the header for everyone.
   const loadUsers = useCallback(async () => {
-    if (!isEditor) return;
     try {
       const u = await sbSelect('cashflow_users', 'select=user_id,email,display_name,role,active&active=eq.true&order=display_name.asc', access.session);
       setAllUsers(u || []);
     } catch (e) { /* non-fatal */ }
-  }, [isEditor, access.session]);
+  }, [access.session]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
   useEffect(() => { loadUsers(); }, [loadUsers]);
@@ -814,12 +840,15 @@ function ProjectDetailPage({ id, access, navigate }) {
       <ProjectDetailHeader
         project={project} setProject={setProject}
         access={access} isEditor={isEditor}
+        invoices={invoices}
         showFlash={showFlash} reloadAll={loadAll}
       />
 
       <HeaderSection
         project={project} setProject={setProject}
         access={access} showFlash={showFlash}
+        assignees={assignees} setAssignees={setAssignees}
+        allUsers={allUsers}
       />
 
       <ScheduleSection
@@ -834,15 +863,9 @@ function ProjectDetailPage({ id, access, navigate }) {
 
       <RetentionPotCard project={project} invoices={invoices} releases={releases} />
 
-      <ProjectMiniCashflowSection project={project} invoices={invoices} releases={releases} />
+      <CashflowReconciliationCard project={project} invoices={invoices} releases={releases} />
 
-      {isEditor && (
-        <AssigneesSection
-          project={project} assignees={assignees} setAssignees={setAssignees}
-          allUsers={allUsers} access={access} showFlash={showFlash}
-          reloadAssignees={loadAll}
-        />
-      )}
+      <ProjectMiniCashflowSection project={project} invoices={invoices} releases={releases} />
 
       <AuditLogSection project={project} />
     </div>
@@ -852,7 +875,7 @@ function ProjectDetailPage({ id, access, navigate }) {
 // ============================================================
 // HEADER STRIP — name, status badge, actions
 // ============================================================
-function ProjectDetailHeader({ project, setProject, access, isEditor, showFlash, reloadAll }) {
+function ProjectDetailHeader({ project, setProject, access, isEditor, invoices, showFlash, reloadAll }) {
   const [confirm, setConfirm] = useState(null);
   const [busy, setBusy] = useState(false);
   const badge = PROJECT_STATUS_BADGE[project.status] || PROJECT_STATUS_BADGE.draft;
@@ -936,12 +959,29 @@ function ProjectDetailHeader({ project, setProject, access, isEditor, showFlash,
                 )}
                 {next.forward && next.forward !== 'archived' && (
                   <button
-                    onClick={() => setConfirm({
-                      title: `Mark as ${next.forward}?`,
-                      message: `This will change the project status from ${project.status} to ${next.forward}.`,
-                      confirmLabel: `Mark as ${next.forward}`,
-                      onConfirm: () => transition(next.forward),
-                    })}
+                    onClick={() => {
+                      // For "Mark as complete" specifically, warn if future payment dates exist.
+                      // Soft warning, not a block — flexibility for early-completion scenarios.
+                      let warning = null;
+                      if (next.forward === 'complete' && Array.isArray(invoices)) {
+                        const today = new Date().toISOString().slice(0, 10);
+                        const terms = Number(project.payment_terms_days) || 30;
+                        const futureRows = invoices.filter(inv => {
+                          const payDate = inv.payment_date_override
+                            || (inv.invoice_date ? addDays(inv.invoice_date, terms) : null);
+                          return payDate && cmpDate(payDate, today) > 0;
+                        });
+                        if (futureRows.length > 0) {
+                          warning = ` ⚠ ${futureRows.length} payment date${futureRows.length === 1 ? '' : 's'} still in the future. Mark complete anyway?`;
+                        }
+                      }
+                      setConfirm({
+                        title: `Mark as ${next.forward}?`,
+                        message: `This will change the project status from ${project.status} to ${next.forward}.${warning || ''}`,
+                        confirmLabel: `Mark as ${next.forward}`,
+                        onConfirm: () => transition(next.forward),
+                      });
+                    }}
                     style={btn(false)}
                   >{next.forward.charAt(0).toUpperCase() + next.forward.slice(1)} →</button>
                 )}
@@ -970,15 +1010,16 @@ function ProjectDetailHeader({ project, setProject, access, isEditor, showFlash,
 // ============================================================
 // HEADER SECTION — display + edit modes
 // ============================================================
-function HeaderSection({ project, setProject, access, showFlash }) {
+function HeaderSection({ project, setProject, access, showFlash, assignees, setAssignees, allUsers }) {
   const [editing, setEditing] = useState(false);
+  const isEditor = access.role === 'editor';
 
   if (!editing) {
     return (
       <SectionBox title="Project header" actions={
-        <button onClick={() => setEditing(true)} style={miniBtn()}>✎ Edit</button>
+        isEditor ? <button onClick={() => setEditing(true)} style={miniBtn()}>✎ Edit</button> : null
       }>
-        <HeaderDisplay project={project} />
+        <HeaderDisplay project={project} assignees={assignees} allUsers={allUsers} />
       </SectionBox>
     );
   }
@@ -989,12 +1030,22 @@ function HeaderSection({ project, setProject, access, showFlash }) {
         onSave={(updated) => { setProject(updated); setEditing(false); showFlash('ok', 'Header updated.'); }}
         onCancel={() => setEditing(false)}
         access={access}
+        assignees={assignees} setAssignees={setAssignees}
+        allUsers={allUsers} showFlash={showFlash}
       />
     </SectionBox>
   );
 }
 
-function HeaderDisplay({ project }) {
+function HeaderDisplay({ project, assignees, allUsers }) {
+  // Resolve owner email → user display label
+  const ownerUser = project.owner_email && allUsers
+    ? allUsers.find(u => u.email === project.owner_email)
+    : null;
+  const ownerLabel = ownerUser
+    ? (ownerUser.display_name ? `${ownerUser.display_name} (${ownerUser.email})` : ownerUser.email)
+    : project.owner_email;
+
   const fields = [
     { label: 'Project name', value: project.name },
     { label: 'Project number', value: project.number },
@@ -1005,7 +1056,7 @@ function HeaderDisplay({ project }) {
     { label: 'End date', value: project.end_date ? fmtDateShort(project.end_date) : null },
     { label: 'Retention release date', value: project.retention_date ? fmtDateShort(project.retention_date) : null },
     { label: 'Payment terms', value: `${project.payment_terms_days} days` },
-    { label: 'Owner', value: project.owner_email },
+    { label: 'Owner', value: ownerLabel },
     { label: 'Payment type', value: project.payment_type === 'stage' ? 'Stage payment' : (project.payment_type === 'valuation' ? 'Valuation' : '—') },
   ];
   if (project.payment_type === 'valuation') {
@@ -1015,21 +1066,49 @@ function HeaderDisplay({ project }) {
       { label: 'Review period', value: project.review_period_days != null ? `${project.review_period_days} days` : null },
     );
   }
+
+  const contributorLabels = (assignees || [])
+    .map(a => {
+      const u = (allUsers || []).find(x => x.user_id === a.user_id);
+      return u ? (u.display_name || u.email) : null;
+    })
+    .filter(Boolean);
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 24px' }}>
-      {fields.map(f => (
-        <div key={f.label} style={{ display: 'flex', gap: 12, minWidth: 0 }}>
-          <div style={{ width: 170, fontSize: 12, color: C.muted, fontWeight: 500, flexShrink: 0 }}>{f.label}</div>
-          <div style={{ fontSize: 13, color: f.value ? C.text : C.muted, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {f.value || '—'}
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 24px' }}>
+        {fields.map(f => (
+          <div key={f.label} style={{ display: 'flex', gap: 12, minWidth: 0 }}>
+            <div style={{ width: 170, fontSize: 12, color: C.muted, fontWeight: 500, flexShrink: 0 }}>{f.label}</div>
+            <div style={{ fontSize: 13, color: f.value ? C.text : C.muted, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {f.value || '—'}
+            </div>
           </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 12, marginTop: 16, paddingTop: 14, borderTop: `1px solid ${C.line}`, alignItems: 'flex-start' }}>
+        <div style={{ width: 170, fontSize: 12, color: C.muted, fontWeight: 500, flexShrink: 0, paddingTop: 2 }}>Contributors</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {contributorLabels.length === 0 ? (
+            <span style={{ fontSize: 13, color: C.muted, fontStyle: 'italic' }}>None</span>
+          ) : (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {contributorLabels.map((label, i) => (
+                <span key={i} style={{
+                  background: C.prussianLight, color: C.prussian,
+                  padding: '2px 10px', borderRadius: 10, fontSize: 12, fontWeight: 600,
+                }}>{label}</span>
+              ))}
+            </div>
+          )}
         </div>
-      ))}
+      </div>
     </div>
   );
 }
 
-function HeaderEditor({ project, onSave, onCancel, access }) {
+function HeaderEditor({ project, onSave, onCancel, access, assignees, setAssignees, allUsers, showFlash }) {
+  const { users } = useCashflowUsers(access.session, true);
   // Re-uses the wizard's Step 1 form shape. Saves directly here, doesn't navigate.
   const [form, setForm] = useState(() => ({
     name:                  project.name || '',
@@ -1103,7 +1182,11 @@ function HeaderEditor({ project, onSave, onCancel, access }) {
           <input value={form.number} onChange={(e) => update('number', e.target.value)} style={inp()} />
         </Field>
         <Field label="Owner">
-          <input value={form.owner_email} onChange={(e) => update('owner_email', e.target.value)} style={inp()} />
+          <UserPicker
+            value={form.owner_email}
+            onChange={(v) => update('owner_email', v)}
+            users={users}
+          />
         </Field>
       </div>
       <div style={threeCol()}>
@@ -1151,6 +1234,15 @@ function HeaderEditor({ project, onSave, onCancel, access }) {
           </Field>
         </div>
       )}
+      <Field label="Contributors (additional people with access)">
+        <ContributorsInline
+          project={project}
+          assignees={assignees} setAssignees={setAssignees}
+          allUsers={allUsers}
+          access={access}
+          showFlash={showFlash}
+        />
+      </Field>
       {error && (
         <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
           {error}
@@ -1295,51 +1387,27 @@ function ScheduleSection({ project, invoices, setInvoices, access, showFlash }) 
           No {isStage ? 'stages' : 'claims'} yet. Click + Add row above.
         </div>
       ) : (
-        <div>
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: isStage ? '40px 1.3fr 1.5fr 1fr 1.8fr 40px' : '40px 1.3fr 1.5fr 1.3fr 1.8fr 40px',
-            gap: 8, padding: '6px 4px',
-            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
-          }}>
-            <div>#</div>
-            <div>Invoice date</div>
-            <div>Payment date</div>
-            <div style={{ textAlign: 'right' }}>{isStage ? '% of value' : '£ gross'}</div>
-            <div>Notes</div>
-            <div></div>
+        <div style={{ overflowX: 'auto' }}>
+          <div style={{ minWidth: isStage ? 1100 : 1050 }}>
+            <ScheduleHeaderRow isStage={isStage} />
+            {rows.map(r => isStage ? (
+              <StageRowEditor
+                key={r._key} row={r} mode="pct" project={project} projectValue={projectValue}
+                onChange={(field, value) => updateRow(r._key, field, value)}
+                onRemove={() => removeRow(r._key)}
+              />
+            ) : (
+              <ValuationRowEditor
+                key={r._key} row={r} project={project}
+                onChange={(field, value) => updateRow(r._key, field, value)}
+                onRemove={() => removeRow(r._key)}
+              />
+            ))}
+            <ScheduleSumRow
+              rows={rows} project={project} isStage={isStage}
+              validSum={validSum} sumPct={sumPct}
+            />
           </div>
-          {rows.map(r => isStage ? (
-            <StageRowEditor
-              key={r._key} row={r} mode="pct" project={project} projectValue={projectValue}
-              onChange={(field, value) => updateRow(r._key, field, value)}
-              onRemove={() => removeRow(r._key)}
-            />
-          ) : (
-            <ValuationRowEditor
-              key={r._key} row={r} project={project}
-              onChange={(field, value) => updateRow(r._key, field, value)}
-              onRemove={() => removeRow(r._key)}
-            />
-          ))}
-          {isStage && (
-            <div style={{
-              display: 'grid', gridTemplateColumns: '40px 1.3fr 1.5fr 1fr 1.8fr 40px',
-              gap: 8, padding: '10px 4px 4px', borderTop: `1px solid ${C.line}`, marginTop: 8, alignItems: 'center',
-            }}>
-              <div></div>
-              <div></div>
-              <div style={{ fontSize: 12, fontWeight: 700, textAlign: 'right' }}>Sum</div>
-              <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums',
-                color: validSum ? C.green : C.redStatus }}>
-                {sumPct.toFixed(4).replace(/\.?0+$/, '')}%
-              </div>
-              <div style={{ fontSize: 12, color: validSum ? C.green : C.redStatus, fontWeight: 600 }}>
-                {validSum ? '✓ Matches 100%' : `Need 100% — ${(100 - sumPct).toFixed(4).replace(/\.?0+$/, '')}% to go`}
-              </div>
-              <div></div>
-            </div>
-          )}
         </div>
       )}
 
@@ -1454,12 +1522,58 @@ function RetentionReleasesSection({ project, releases, setReleases, access, show
     : null;
   const pcAmount = defectsAmount != null ? totalWithheld - defectsAmount : null;
 
+  // Generate suggested release rows from project header values.
+  //   - If defects_retention_pct is set: two rows (PC then End of Defects)
+  //   - Otherwise: one row at retention_date (or end_date) for the full amount
+  //   - PC date defaults to project end_date; End of Defects defaults to retention_date
+  //     (or end_date + 12 months if blank)
+  const canGenerate = totalWithheld > 0 && rows.length === 0;
+  const generateSuggested = () => {
+    const startDate = project.end_date || addDays(new Date().toISOString().slice(0, 10), 0);
+    const eodDate = project.retention_date || (project.end_date ? addDays(project.end_date, 365) : '');
+    const newRows = [];
+    if (pcAmount != null && pcAmount > 0) {
+      newRows.push({
+        _key: `gen-pc-${Date.now()}`,
+        id: null,
+        release_date: startDate,
+        amount: round2(pcAmount),
+        release_type: 'practical_completion',
+        notes: '',
+      });
+      newRows.push({
+        _key: `gen-eod-${Date.now() + 1}`,
+        id: null,
+        release_date: eodDate,
+        amount: round2(defectsAmount),
+        release_type: 'end_of_defects',
+        notes: '',
+      });
+    } else {
+      newRows.push({
+        _key: `gen-single-${Date.now()}`,
+        id: null,
+        release_date: project.retention_date || startDate,
+        amount: round2(totalWithheld),
+        release_type: 'other',
+        notes: '',
+      });
+    }
+    setRows(newRows);
+    setDirty(true);
+  };
+
   return (
     <SectionBox
       title="Retention releases"
       actions={
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           {dirty && <span style={{ fontSize: 11, color: C.amber, fontWeight: 600 }}>● Unsaved</span>}
+          {canGenerate && (
+            <button onClick={generateSuggested} style={miniBtn()} title="Generate suggested release rows from project header">
+              ⚡ Auto-generate
+            </button>
+          )}
           <button onClick={addRow} style={miniBtn()}>+ Add release</button>
         </div>
       }
@@ -1611,6 +1725,64 @@ function RetentionPotCard({ project, invoices, releases }) {
 }
 
 // ============================================================
+// CASHFLOW RECONCILIATION CARD
+// Compares the EXPECTED total cashflow (project value + VAT) against the
+// ACTUAL projected cashflow (sum of invoice-driven cash events + retention releases).
+// Flags up any mismatch so the user knows to fix the schedule.
+// ============================================================
+function CashflowReconciliationCard({ project, invoices, releases }) {
+  const projectValue = Number(project.value) || 0;
+  if (projectValue === 0) return null;
+  const vatRate = (project.vat_rate == null || project.vat_rate === '') ? 0.20 : Number(project.vat_rate);
+
+  // Expected: every pound of the project value lands in Arke's account (after
+  // retention is held and then released) plus VAT on top of all of it.
+  const expectedTotal = projectValue * (1 + vatRate);
+
+  // Actual: sum of all projected cash events for this project. The engine
+  // already deducts retention from invoices and accounts for retention releases.
+  const events = projectCashEvents(project, invoices, releases);
+  const actualTotal = events.reduce((s, e) => s + e.gross, 0);
+
+  const diff = expectedTotal - actualTotal;
+  const reconciles = Math.abs(diff) < 0.01;
+  const short = diff > 0; // schedule + releases come up short
+  const over = diff < 0;  // schedule + releases overshoot
+
+  const stat = (label, value, color) => (
+    <div style={{ minWidth: 0 }}>
+      <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: color || C.text, fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
+        £{fmtMoney(value)}
+      </div>
+    </div>
+  );
+
+  return (
+    <SectionBox title="Cashflow reconciliation">
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+        Every pound of the project value should land in Arke's bank account by the time the schedule and retention releases are complete. Mismatches usually mean the schedule is missing rows, retention isn't fully scheduled for release, or a value is wrong.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+        {stat('Expected (value + VAT)', expectedTotal, C.text)}
+        {stat('Projected cashflow', actualTotal, reconciles ? C.green : C.text)}
+        {stat(short ? 'Short by' : (over ? 'Over by' : 'Difference'), Math.abs(diff), reconciles ? C.green : C.redStatus)}
+      </div>
+      {reconciles ? (
+        <div style={{ background: C.greenLight, color: C.green, padding: 10, borderRadius: 6, fontSize: 12, marginTop: 12, borderLeft: `3px solid ${C.green}`, fontWeight: 500 }}>
+          ✓ Cashflow fully reconciles to the project value.
+        </div>
+      ) : (
+        <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 12, marginTop: 12, borderLeft: `3px solid ${C.redStatus}`, fontWeight: 500, lineHeight: 1.5 }}>
+          ⚠ Schedule + retention releases {short ? 'come up short by' : 'overshoot by'} £{fmtMoney(Math.abs(diff))}.
+          {short && (project.retention_pct > 0) && ' Have you added retention release rows for the full retention amount?'}
+        </div>
+      )}
+    </SectionBox>
+  );
+}
+
+// ============================================================
 // PROJECT CASHFLOW ENGINE
 // Compute per-cash-event details for a single project.
 // Used by the mini-cashflow section here and (later) the master grid.
@@ -1620,7 +1792,9 @@ function projectCashEvents(project, invoices, releases) {
   const events = [];
   const projectValue = Number(project.value) || 0;
   const retPct = Number(project.retention_pct) || 0;
-  const vatRate = Number(project.vat_rate) != null ? Number(project.vat_rate) : 0.20;
+  // VAT rate defaults to 20% if column is null/undefined. Number(null) returns 0
+  // (not null), so we must check the raw value before coercing.
+  const vatRate = (project.vat_rate == null || project.vat_rate === '') ? 0.20 : Number(project.vat_rate);
   const terms = Number(project.payment_terms_days) || 30;
 
   for (const inv of (invoices || [])) {
@@ -1764,13 +1938,14 @@ function ProjectMiniCashflowSection({ project, invoices, releases }) {
 }
 
 // ============================================================
-// ASSIGNEES SECTION (editor only)
+// CONTRIBUTORS INLINE — compact chips + add picker
+// Used inside HeaderEditor (and wizard Step 1). Self-contained — manages its own
+// busy state and reports up via showFlash callback.
 // ============================================================
-function AssigneesSection({ project, assignees, setAssignees, allUsers, access, showFlash, reloadAssignees }) {
+function ContributorsInline({ project, assignees, setAssignees, allUsers, access, showFlash }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  // For displaying assignee email/name, we need allUsers loaded
   const assigneeRows = (assignees || []).map(a => {
     const u = (allUsers || []).find(x => x.user_id === a.user_id);
     return { ...a, email: u ? u.email : '(unknown)', display_name: u ? u.display_name : null, role: u ? u.role : null };
@@ -1787,8 +1962,7 @@ function AssigneesSection({ project, assignees, setAssignees, allUsers, access, 
         project_id: project.id, user_id: userId,
         added_by_email: getEmail(access.session),
       }], access.session);
-      // Log on project audit
-      const target = allUsers.find(u => u.user_id === userId);
+      const target = (allUsers || []).find(u => u.user_id === userId);
       await sbUpdate('projects', `id=eq.${project.id}`, {
         audit_log: [
           ...(Array.isArray(project.audit_log) ? project.audit_log : []),
@@ -1797,8 +1971,8 @@ function AssigneesSection({ project, assignees, setAssignees, allUsers, access, 
       }, access.session);
       setAssignees([...(assignees || []), inserted[0]]);
       setPickerOpen(false);
-      showFlash('ok', `Added ${target ? target.email : 'user'} to project.`);
-    } catch (e) { showFlash('err', 'Could not add: ' + e.message); }
+      if (showFlash) showFlash('ok', `Added ${target ? (target.display_name || target.email) : 'user'}.`);
+    } catch (e) { if (showFlash) showFlash('err', 'Could not add: ' + e.message); }
     finally { setBusy(false); }
   };
 
@@ -1814,32 +1988,47 @@ function AssigneesSection({ project, assignees, setAssignees, allUsers, access, 
         ],
       }, access.session);
       setAssignees((assignees || []).filter(a => a.user_id !== userId));
-      showFlash('ok', 'Removed.');
-    } catch (e) { showFlash('err', 'Could not remove: ' + e.message); }
+      if (showFlash) showFlash('ok', 'Removed.');
+    } catch (e) { if (showFlash) showFlash('err', 'Could not remove: ' + e.message); }
     finally { setBusy(false); }
   };
 
   return (
-    <SectionBox
-      title="Assignees"
-      actions={
-        <button
-          onClick={() => setPickerOpen(o => !o)}
-          disabled={busy || eligibleUsers.length === 0}
-          style={miniBtn()}
-        >
-          + Add user
-        </button>
-      }
-    >
-      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
-        Users assigned here can view and edit this project. Editors implicitly have access to all projects.
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', minHeight: 32 }}>
+        {assigneeRows.length === 0 && !pickerOpen && (
+          <span style={{ fontSize: 12, color: C.muted, fontStyle: 'italic' }}>None yet.</span>
+        )}
+        {assigneeRows.map(a => (
+          <span key={a.user_id} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            background: a.role === 'editor' ? C.redLight : C.prussianLight,
+            color: a.role === 'editor' ? C.red : C.prussian,
+            padding: '4px 6px 4px 10px', borderRadius: 14, fontSize: 12, fontWeight: 600,
+          }}>
+            {a.display_name || a.email}
+            <button
+              onClick={() => remove(a.user_id)} disabled={busy}
+              style={{
+                background: 'transparent', border: 'none', cursor: 'pointer',
+                color: 'inherit', padding: '0 4px', fontSize: 14, lineHeight: 1, opacity: 0.7,
+              }}
+              title="Remove"
+            >×</button>
+          </span>
+        ))}
+        {eligibleUsers.length > 0 && (
+          <button
+            onClick={() => setPickerOpen(o => !o)}
+            disabled={busy}
+            style={{ ...miniBtn(), padding: '4px 10px' }}
+          >
+            {pickerOpen ? 'Close' : '+ Add'}
+          </button>
+        )}
       </div>
       {pickerOpen && (
-        <div style={{ marginBottom: 12, padding: 12, background: C.bg, borderRadius: 6 }}>
-          <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            Pick a user to assign
-          </div>
+        <div style={{ marginTop: 8, padding: 10, background: C.bg, borderRadius: 6 }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 6 }}>
             {eligibleUsers.length === 0 ? (
               <div style={{ fontSize: 12, color: C.muted }}>Everyone is already assigned.</div>
@@ -1863,41 +2052,7 @@ function AssigneesSection({ project, assignees, setAssignees, allUsers, access, 
           </div>
         </div>
       )}
-      {assigneeRows.length === 0 ? (
-        <div style={{ padding: 16, textAlign: 'center', color: C.muted, fontSize: 13, border: `1px dashed ${C.line}`, borderRadius: 6 }}>
-          No one assigned yet.
-        </div>
-      ) : (
-        <div>
-          {assigneeRows.map(a => (
-            <div key={a.user_id} style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              padding: '8px 10px', borderBottom: `1px solid ${C.line}`,
-            }}>
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{a.display_name || a.email}</div>
-                  {a.display_name && <div style={{ fontSize: 11, color: C.muted }}>{a.email}</div>}
-                </div>
-                {a.role && (
-                  <span style={{
-                    background: a.role === 'editor' ? C.redLight : C.prussianLight,
-                    color: a.role === 'editor' ? C.red : C.prussian,
-                    padding: '2px 8px', borderRadius: 8, fontSize: 10, fontWeight: 600,
-                  }}>{a.role === 'editor' ? 'Editor' : 'Contributor'}</span>
-                )}
-              </div>
-              <div style={{ fontSize: 11, color: C.muted }}>
-                Added {timeAgo(a.added_at)}
-                <button onClick={() => remove(a.user_id)} disabled={busy} style={{ ...miniBtn(), marginLeft: 12, color: C.redStatus }}>
-                  Remove
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </SectionBox>
+    </div>
   );
 }
 
@@ -1918,6 +2073,7 @@ const AUDIT_EVENT_LABELS = {
 };
 
 function AuditLogSection({ project }) {
+  const [expanded, setExpanded] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const log = Array.isArray(project.audit_log) ? project.audit_log : [];
   // Newest first
@@ -1925,8 +2081,19 @@ function AuditLogSection({ project }) {
   const visible = showAll ? sorted : sorted.slice(0, 10);
 
   return (
-    <SectionBox title="Activity">
-      {sorted.length === 0 ? (
+    <SectionBox
+      title={`Activity${sorted.length > 0 ? ` (${sorted.length})` : ''}`}
+      actions={
+        <button onClick={() => setExpanded(e => !e)} style={miniBtn()}>
+          {expanded ? '▾ Hide' : '▸ Show'}
+        </button>
+      }
+    >
+      {!expanded ? (
+        <div style={{ fontSize: 12, color: C.muted, fontStyle: 'italic' }}>
+          {sorted.length === 0 ? 'No activity yet.' : `${sorted.length} event${sorted.length === 1 ? '' : 's'} logged. Click Show to expand.`}
+        </div>
+      ) : sorted.length === 0 ? (
         <div style={{ padding: 16, textAlign: 'center', color: C.muted, fontSize: 13 }}>No activity yet.</div>
       ) : (
         <React.Fragment>
@@ -2288,6 +2455,21 @@ function WizardStepper({ step, project }) {
 // WIZARD STEP 1 — HEADER
 // ============================================================
 function WizardStep1Header({ access, project, setProject, onNext }) {
+  // Owner defaults to current user on fresh project. On resume, use saved value.
+  const currentUserEmail = getEmail(access.session);
+  const { users } = useCashflowUsers(access.session, true);
+  // Assignees state — only loaded if project exists (need project.id to query)
+  const [assignees, setAssignees] = useState([]);
+  useEffect(() => {
+    if (!project) return;
+    (async () => {
+      try {
+        const a = await sbSelect('project_contributors', `project_id=eq.${project.id}`, access.session);
+        setAssignees(a || []);
+      } catch (e) { /* non-fatal */ }
+    })();
+  }, [project, access.session]);
+
   const [form, setForm] = useState(() => ({
     name:              project ? (project.name || '') : '',
     number:            project ? (project.number || '') : '',
@@ -2298,7 +2480,7 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
     end_date:          project ? (project.end_date || '') : '',
     retention_date:    project ? (project.retention_date || '') : '',
     payment_terms_days: project ? project.payment_terms_days : 30,
-    owner_email:       project ? (project.owner_email || '') : '',
+    owner_email:       project ? (project.owner_email || '') : (currentUserEmail || ''),
   }));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -2373,7 +2555,11 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
           <input value={form.number} onChange={(e) => update('number', e.target.value)} style={inp()} placeholder="e.g. P-2401" />
         </Field>
         <Field label="Owner">
-          <input value={form.owner_email} onChange={(e) => update('owner_email', e.target.value)} style={inp()} placeholder="who@arkecreative.co.uk" />
+          <UserPicker
+            value={form.owner_email}
+            onChange={(v) => update('owner_email', v)}
+            users={users}
+          />
         </Field>
       </div>
 
@@ -2430,6 +2616,21 @@ function WizardStep1Header({ access, project, setProject, onNext }) {
       <Field label="Payment terms (days)">
         <NumberInput value={form.payment_terms_days} onChange={(v) => update('payment_terms_days', v)} step="1" placeholder="30" />
       </Field>
+
+      {project ? (
+        <Field label="Contributors (additional people with access)">
+          <ContributorsInline
+            project={project}
+            assignees={assignees} setAssignees={setAssignees}
+            allUsers={users}
+            access={access}
+          />
+        </Field>
+      ) : (
+        <div style={{ background: C.bg, padding: 12, borderRadius: 6, fontSize: 12, color: C.muted, marginBottom: 14, fontStyle: 'italic' }}>
+          Contributors can be added once the project is saved.
+        </div>
+      )}
 
       {error && (
         <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
@@ -2712,53 +2913,24 @@ function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
           No stages yet. Add one above or use “Split evenly”.
         </div>
       ) : (
-        <div>
-          <div style={{
-            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
-            gap: 8, padding: '6px 4px',
-            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
-          }}>
-            <div>#</div>
-            <div>Invoice date</div>
-            <div>Payment date</div>
-            <div style={{ textAlign: 'right' }}>{mode === 'pct' ? '% of value' : '£ net'}</div>
-            <div>Notes</div>
-            <div></div>
-          </div>
-          {rows.map((r, i) => (
-            <StageRowEditor
-              key={r._key}
-              row={r}
-              mode={mode}
-              project={project}
-              projectValue={projectValue}
-              onChange={(field, value) => updateRow(r._key, field, value)}
-              onRemove={() => removeRow(r._key)}
+        <div style={{ overflowX: 'auto' }}>
+          <div style={{ minWidth: 1100 }}>
+            <ScheduleHeaderRow isStage={true} />
+            {rows.map((r, i) => (
+              <StageRowEditor
+                key={r._key}
+                row={r}
+                mode={mode}
+                project={project}
+                projectValue={projectValue}
+                onChange={(field, value) => updateRow(r._key, field, value)}
+                onRemove={() => removeRow(r._key)}
+              />
+            ))}
+            <ScheduleSumRow
+              rows={rows} project={project} isStage={true}
+              validSum={validSum} sumPct={sumPct}
             />
-          ))}
-
-          {/* Sum indicator */}
-          <div style={{
-            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
-            gap: 8, padding: '10px 4px 4px',
-            borderTop: `1px solid ${C.line}`, marginTop: 8,
-            alignItems: 'center',
-          }}>
-            <div></div>
-            <div></div>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, textAlign: 'right' }}>Sum</div>
-            <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums',
-              color: validSum ? C.green : C.redStatus }}>
-              {mode === 'pct' ? `${sumPct.toFixed(4).replace(/\.?0+$/,'')}%` : `£${fmtMoney(sumGbp)}`}
-            </div>
-            <div style={{ fontSize: 12, color: validSum ? C.green : C.redStatus, fontWeight: 600 }}>
-              {validSum
-                ? '✓ Matches'
-                : (mode === 'pct'
-                  ? `Need 100% — ${(100 - sumPct).toFixed(4).replace(/\.?0+$/,'')}% to go`
-                  : `Need £${fmtMoney(projectValue)} — £${fmtMoney(projectValue - sumGbp)} to go`)}
-            </div>
-            <div></div>
           </div>
         </div>
       )}
@@ -2779,32 +2951,182 @@ function StageScheduleEditor({ access, project, setProject, onBack, onNext }) {
   );
 }
 
+// Grid template for schedule rows. Kept in one place so the header, rows, and
+// footer all agree on column widths.
+const STAGE_GRID = '36px 130px 165px 80px 110px 110px 110px 110px 120px minmax(140px, 1fr) 32px';
+const VAL_GRID   = '36px 130px 165px 110px 110px 110px 110px 120px minmax(140px, 1fr) 32px';
+
+// Compute the math for a single invoice/claim row given the project header.
+// Returns { gross, retention, subtotal, vat, total } — all numbers (£), zero if not yet entered.
+function computeRowBreakdown(row, project, isStage) {
+  const projectValue = Number(project.value) || 0;
+  const retPct = Number(project.retention_pct) || 0;
+  const vatRate = (project.vat_rate == null || project.vat_rate === '') ? 0.20 : Number(project.vat_rate);
+
+  let gross = 0;
+  if (isStage) {
+    const pct = Number(row.invoice_pct);
+    if (!isNaN(pct)) gross = pct / 100 * projectValue;
+  } else {
+    const v = Number(row.invoice_value_net);
+    if (!isNaN(v)) gross = v;
+  }
+  const retention = gross * (retPct / 100);
+  const subtotal = gross - retention;
+  const vat = subtotal * vatRate;
+  const total = subtotal + vat;
+  return { gross, retention, subtotal, vat, total };
+}
+
+// Small read-only money cell used in the schedule breakdown.
+function DerivedMoneyCell({ value, color, bold }) {
+  return (
+    <div style={{
+      padding: '8px 8px', background: C.redSoft, border: `1px solid ${C.line}`,
+      borderRadius: 4, fontSize: 13, fontWeight: bold ? 700 : 500,
+      color: color || C.text, textAlign: 'right',
+      fontVariantNumeric: 'tabular-nums', minWidth: 0,
+      boxSizing: 'border-box', overflow: 'hidden', textOverflow: 'ellipsis',
+    }}>
+      {value === 0 || value ? `£${fmtMoney(value)}` : '—'}
+    </div>
+  );
+}
+
+// Header row for the schedule breakdown table. Shared by wizard + detail page.
+function ScheduleHeaderRow({ isStage }) {
+  const headerCell = (label, align) => (
+    <div style={{
+      fontSize: 11, color: C.muted, fontWeight: 600,
+      textTransform: 'uppercase', letterSpacing: '0.05em',
+      textAlign: align || 'left',
+    }}>{label}</div>
+  );
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: isStage ? STAGE_GRID : VAL_GRID,
+      gap: 8, padding: '6px 4px',
+      borderBottom: `1px solid ${C.line}`, marginBottom: 4,
+    }}>
+      {headerCell('#')}
+      {headerCell('Invoice date')}
+      {headerCell('Payment date')}
+      {isStage && headerCell('%', 'right')}
+      {headerCell('Amount £', 'right')}
+      {headerCell('Retention £', 'right')}
+      {headerCell('Subtotal', 'right')}
+      {headerCell('VAT', 'right')}
+      {headerCell('Total', 'right')}
+      {headerCell('Notes')}
+      {headerCell('')}
+    </div>
+  );
+}
+
+// Sum row at the bottom of the schedule. Totals every numeric column.
+// Also shows the % validation indicator for stage schedules.
+function ScheduleSumRow({ rows, project, isStage, validSum, sumPct }) {
+  let totals = { gross: 0, retention: 0, subtotal: 0, vat: 0, total: 0 };
+  for (const r of (rows || [])) {
+    const bd = computeRowBreakdown(r, project, isStage);
+    totals.gross += bd.gross;
+    totals.retention += bd.retention;
+    totals.subtotal += bd.subtotal;
+    totals.vat += bd.vat;
+    totals.total += bd.total;
+  }
+
+  // Cell that shows the percentage sum (stage only)
+  const pctSumCell = (
+    <div style={{
+      padding: '8px 8px', background: C.redSoft,
+      border: `1px solid ${validSum ? C.line : C.redStatus}`,
+      borderRadius: 4, fontSize: 13, fontWeight: 700,
+      color: validSum ? C.green : C.redStatus, textAlign: 'right',
+      fontVariantNumeric: 'tabular-nums', minWidth: 0,
+      boxSizing: 'border-box',
+    }}>
+      {sumPct != null ? `${sumPct.toFixed(4).replace(/\.?0+$/, '')}%` : '—'}
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: isStage ? STAGE_GRID : VAL_GRID,
+        gap: 8, padding: '10px 4px 4px',
+        borderTop: `2px solid ${C.line}`, marginTop: 8, alignItems: 'center',
+      }}>
+        {/* # — empty */}
+        <div></div>
+        {/* Invoice date — empty, except for the 'Sum' label */}
+        <div style={{ fontSize: 12, fontWeight: 700, color: C.text, paddingLeft: 4 }}>Sum</div>
+        {/* Payment date — empty */}
+        <div></div>
+        {/* % (stage only) */}
+        {isStage && pctSumCell}
+        {/* Gross */}
+        <DerivedMoneyCell value={totals.gross} bold />
+        {/* Retention (negative for clarity) */}
+        <DerivedMoneyCell
+          value={totals.retention === 0 ? 0 : -totals.retention}
+          bold
+          color={totals.retention > 0 ? C.redStatus : undefined}
+        />
+        {/* Subtotal */}
+        <DerivedMoneyCell value={totals.subtotal} bold />
+        {/* VAT */}
+        <DerivedMoneyCell value={totals.vat} bold />
+        {/* Total */}
+        <DerivedMoneyCell value={totals.total} bold color={C.green} />
+        {/* Notes — empty */}
+        <div></div>
+        {/* × — empty */}
+        <div></div>
+      </div>
+
+      {isStage && (
+        <div style={{
+          padding: '6px 4px',
+          fontSize: 12, color: validSum ? C.green : C.redStatus, fontWeight: 600,
+          textAlign: 'right',
+        }}>
+          {validSum
+            ? `✓ Stages sum to 100%`
+            : `⚠ Stages sum to ${sumPct.toFixed(4).replace(/\.?0+$/, '')}% — need 100% (${(100 - sumPct).toFixed(4).replace(/\.?0+$/, '')}% to go)`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StageRowEditor({ row, mode, project, projectValue, onChange, onRemove }) {
   const valueShown = mode === 'pct'
     ? row.invoice_pct
     : (row.invoice_pct === '' ? '' : (Number(row.invoice_pct) / 100 * projectValue));
 
-  // Date validation & hints
   const terms = Number(project.payment_terms_days) || 30;
   const startDate = project.start_date || null;
   const endDate = project.end_date || null;
   const computedPayment = row.invoice_date ? addDays(row.invoice_date, terms) : '';
 
-  // Warnings (soft, do not block save)
   let invoiceWarning = null;
   if (row.invoice_date && startDate && cmpDate(row.invoice_date, startDate) < 0) {
     invoiceWarning = 'Before project start';
   } else if (row.invoice_date && endDate && cmpDate(row.invoice_date, endDate) > 0) {
     invoiceWarning = 'After project end';
   }
-  // Hard error (used by save logic in parent — also flagged in UI)
   const paymentBeforeInvoice =
     row.payment_date_override && row.invoice_date
     && cmpDate(row.payment_date_override, row.invoice_date) < 0;
 
+  const bd = computeRowBreakdown(row, project, true);
+
   return (
     <div style={{
-      display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1fr 1.8fr 40px',
+      display: 'grid', gridTemplateColumns: STAGE_GRID,
       gap: 8, padding: '6px 4px', alignItems: 'flex-start',
     }}>
       <div style={{ fontSize: 12, color: C.muted, fontWeight: 600, paddingTop: 8 }}>{row.sequence}</div>
@@ -2829,6 +3151,11 @@ function StageRowEditor({ row, mode, project, projectValue, onChange, onRemove }
         step={mode === 'pct' ? '0.01' : '1'}
         align="right"
       />
+      <DerivedMoneyCell value={bd.gross} />
+      <DerivedMoneyCell value={bd.retention === 0 ? 0 : -bd.retention} color={bd.retention > 0 ? C.redStatus : undefined} />
+      <DerivedMoneyCell value={bd.subtotal} />
+      <DerivedMoneyCell value={bd.vat} />
+      <DerivedMoneyCell value={bd.total} bold color={C.green} />
       <input value={row.notes} onChange={(e) => onChange('notes', e.target.value)} style={inp()} placeholder="Optional" />
       <button onClick={onRemove} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
     </div>
@@ -2993,45 +3320,26 @@ function ValuationScheduleEditor({ access, project, setProject, onBack, onNext }
           No claims yet. Add one above or generate a schedule.
         </div>
       ) : (
-        <div>
-          <div style={{
-            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
-            gap: 8, padding: '6px 4px',
-            fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
-          }}>
-            <div>#</div>
-            <div>Invoice date</div>
-            <div>Payment date</div>
-            <div style={{ textAlign: 'right' }}>£ net</div>
-            <div>Notes</div>
-            <div></div>
-          </div>
-          {rows.map(r => (
-            <ValuationRowEditor
-              key={r._key} row={r}
-              project={project}
-              onChange={(field, value) => updateRow(r._key, field, value)}
-              onRemove={() => removeRow(r._key)}
+        <div style={{ overflowX: 'auto' }}>
+          <div style={{ minWidth: 1050 }}>
+            <ScheduleHeaderRow isStage={false} />
+            {rows.map(r => (
+              <ValuationRowEditor
+                key={r._key} row={r}
+                project={project}
+                onChange={(field, value) => updateRow(r._key, field, value)}
+                onRemove={() => removeRow(r._key)}
+              />
+            ))}
+            <ScheduleSumRow
+              rows={rows} project={project} isStage={false}
             />
-          ))}
-          <div style={{
-            display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
-            gap: 8, padding: '10px 4px 4px',
-            borderTop: `1px solid ${C.line}`, marginTop: 8, alignItems: 'center',
-          }}>
-            <div></div>
-            <div></div>
-            <div style={{ fontSize: 12, fontWeight: 700, textAlign: 'right' }}>Sum</div>
-            <div style={{ textAlign: 'right', fontWeight: 700, fontSize: 13, fontVariantNumeric: 'tabular-nums' }}>
-              £{fmtMoney(sumGbp)}
-            </div>
-            <div style={{ fontSize: 12, color: C.muted }}>
-              of £{fmtMoney(projectValue)} project value
-              {projectValue > 0 && (
-                <span style={{ marginLeft: 6 }}>({(sumGbp / projectValue * 100).toFixed(1)}%)</span>
+            <div style={{ fontSize: 12, color: C.muted, padding: '6px 4px', textAlign: 'right' }}>
+              Project value: £{fmtMoney(projectValue)}
+              {projectValue > 0 && sumGbp > 0 && (
+                <span style={{ marginLeft: 6 }}>· claims at {(sumGbp / projectValue * 100).toFixed(1)}% of value</span>
               )}
             </div>
-            <div></div>
           </div>
         </div>
       )}
@@ -3068,9 +3376,11 @@ function ValuationRowEditor({ row, project, onChange, onRemove }) {
     row.payment_date_override && row.invoice_date
     && cmpDate(row.payment_date_override, row.invoice_date) < 0;
 
+  const bd = computeRowBreakdown(row, project, false);
+
   return (
     <div style={{
-      display: 'grid', gridTemplateColumns: '40px 1.3fr 1.3fr 1.3fr 1.8fr 40px',
+      display: 'grid', gridTemplateColumns: VAL_GRID,
       gap: 8, padding: '6px 4px', alignItems: 'flex-start',
     }}>
       <div style={{ fontSize: 12, color: C.muted, fontWeight: 600, paddingTop: 8 }}>{row.sequence}</div>
@@ -3090,6 +3400,10 @@ function ValuationRowEditor({ row, project, onChange, onRemove }) {
         error={paymentBeforeInvoice}
       />
       <NumberInput value={row.invoice_value_net} onChange={(v) => onChange('invoice_value_net', v)} step="0.01" align="right" />
+      <DerivedMoneyCell value={bd.retention === 0 ? 0 : -bd.retention} color={bd.retention > 0 ? C.redStatus : undefined} />
+      <DerivedMoneyCell value={bd.subtotal} />
+      <DerivedMoneyCell value={bd.vat} />
+      <DerivedMoneyCell value={bd.total} bold color={C.green} />
       <input value={row.notes} onChange={(e) => onChange('notes', e.target.value)} style={inp()} placeholder="Optional" />
       <button onClick={onRemove} style={{ ...miniBtn(), color: C.redStatus, padding: '6px 8px' }}>×</button>
     </div>
@@ -3384,6 +3698,30 @@ function MoneyInput({ value, onChange, disabled }) {
         placeholder="0.00"
       />
     </div>
+  );
+}
+
+// UserPicker — dropdown of active cashflow_users. Stores the user's email,
+// which is what owner_email expects. Empty value = unset.
+function UserPicker({ value, onChange, users, disabled, placeholder }) {
+  if (!users) {
+    return <div style={{ ...inp(true), color: C.muted, fontStyle: 'italic' }}>Loading users…</div>;
+  }
+  return (
+    <select
+      value={value || ''}
+      onChange={(e) => onChange(e.target.value || null)}
+      disabled={disabled}
+      style={inp(disabled)}
+    >
+      <option value="">{placeholder || '— Not assigned —'}</option>
+      {users.map(u => (
+        <option key={u.user_id} value={u.email}>
+          {u.display_name ? `${u.display_name} (${u.email})` : u.email}
+          {u.role === 'editor' ? ' · Editor' : ''}
+        </option>
+      ))}
+    </select>
   );
 }
 
