@@ -1102,12 +1102,23 @@ function CashflowPage({ access }) {
   // Column-header formatter. At rotated zooms, headers also rotate (handled by
   // the parent cell style), so show full date "DD MMM". At horizontal mode show
   // "DD Mmm" (no year — month strip handles year separation).
+  // Column-header formatter. At rotated zooms (26w/52w), headers also rotate
+  // (handled by the parent cell style) and show "DD Mmm" inline. At 13w show
+  // a two-line stacked label: "DD Mmm" on top, "YYYY" underneath — applied
+  // uniformly across the row so every header has the same visual shape.
   const fmtWeekHeader = (wk) => {
+    const d = new Date(wk + 'T00:00:00Z');
     if (zoomConfig.rotated) {
-      const d = new Date(wk + 'T00:00:00Z');
       return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
     }
-    return fmtDateShort(wk).replace(/, 20\d\d/, '');
+    const dayMonth = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+    const year = String(d.getUTCFullYear());
+    return (
+      <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-end', lineHeight: 1.15 }}>
+        <span>{dayMonth}</span>
+        <span style={{ fontWeight: 500, opacity: 0.7 }}>{year}</span>
+      </span>
+    );
   };
 
   // Style for a rotated text container. The trick: wrap an inline-block that is
@@ -1353,7 +1364,7 @@ function CashflowPage({ access }) {
                   <div key={wk} style={{
                     display: 'flex',
                     alignItems: zoomConfig.rotated ? 'flex-end' : 'center',
-                    justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                    justifyContent: 'flex-end',
                     padding: zoomConfig.rotated ? '4px 0' : '0 4px',
                     fontSize: zoomConfig.fontSize,
                     minWidth: 0, overflow: 'hidden',
@@ -1365,8 +1376,8 @@ function CashflowPage({ access }) {
                   padding: zoomConfig.rotated ? '4px 0' : '0 8px',
                   fontSize: 11,
                   display: 'flex',
-                  alignItems: zoomConfig.rotated ? 'flex-end' : 'flex-end',
-                  justifyContent: zoomConfig.rotated ? 'center' : 'flex-end',
+                  alignItems: 'flex-end',
+                  justifyContent: 'flex-end',
                 }}><CellText>Total</CellText></div>
               </div>
 
@@ -1380,7 +1391,7 @@ function CashflowPage({ access }) {
                   fmtCellAmount(row.rowTotal),
                 ];
                 const rowMinHeight = rowMinHeightFor(rowValues);
-                const cellJustify = rowMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                const cellJustify = 'flex-end';
                 return (
                   <div key={p.id} style={{
                     display: 'grid',
@@ -1468,7 +1479,7 @@ function CashflowPage({ access }) {
                   fmtCellAmount(grid.unmatched.rowTotal),
                 ];
                 const odMinHeight = rowMinHeightFor(odValues);
-                const odJustify = odMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                const odJustify = 'flex-end';
                 return (
                 <div style={{
                   display: 'grid',
@@ -1548,7 +1559,7 @@ function CashflowPage({ access }) {
                   fmtCellAmount(grid.grandTotal),
                 ];
                 const wtMinHeight = rowMinHeightFor(wtValues);
-                const wtJustify = wtMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                const wtJustify = 'flex-end';
                 return (
               <div style={{
                 display: 'grid',
@@ -1598,7 +1609,7 @@ function CashflowPage({ access }) {
               {(() => {
                 const rbValues = runningBalance.map(b => fmtCellAmount(b));
                 const rbMinHeight = rowMinHeightFor(rbValues);
-                const rbJustify = rbMinHeight ? 'center' : (zoomConfig.rotated ? 'center' : 'flex-end');
+                const rbJustify = 'flex-end';
                 return (
               <div style={{
                 display: 'grid',
