@@ -308,6 +308,26 @@ function addDays(iso, days) {
   return d.toISOString().slice(0, 10);
 }
 
+// Add N calendar months to an ISO date, preserving the day-of-month where
+// possible. If the target month has fewer days (e.g. 31 Jan + 1 month →
+// 28/29 Feb), clamp to the last valid day of that month — matches the typical
+// "monthly bill" expectation.
+function addMonths(iso, months) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return '';
+  const originalDay = d.getUTCDate();
+  // Move to first of the month, add months, then put the day back (clamped)
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  // Find last day of the resulting month
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth();
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(originalDay, lastDay));
+  return d.toISOString().slice(0, 10);
+}
+
 // Compare two ISO dates (YYYY-MM-DD). Returns -1/0/1. Missing dates compare as 0.
 function cmpDate(a, b) {
   if (!a || !b) return 0;
@@ -531,11 +551,10 @@ function RouteSwitch({ route, navigate, access }) {
   if (seg === 'debtors') {
     return <DebtorsPage access={access} />;
   }
-  if (seg === 'overheads') return <OverheadListStub />;
+  if (seg === 'overheads') return <OverheadsPage access={access} />;
   if (seg === 'settings') {
     if (route.path[1] === 'users') return <SettingsUsersPage access={access} />;
-    if (route.path[1] === 'categories') return <SettingsCategoriesStub />;
-    if (route.path[1] === 'csv-presets') return <SettingsCsvPresetsStub />;
+    if (route.path[1] === 'categories') return <SettingsCategoriesPage access={access} />;
     return <SettingsHub access={access} />;
   }
   return <NotFound navigate={navigate} />;
@@ -860,6 +879,8 @@ function CashflowPage({ access }) {
   const [invoicesByProject, setInvoicesByProject] = useState({});
   const [releasesByProject, setReleasesByProject] = useState({});
   const [debtors, setDebtors] = useState(null);
+  const [overheads, setOverheads] = useState(null);
+  const [overheadCategories, setOverheadCategories] = useState(null);
   const [settings, setSettings] = useState(null);
   const [windowWeeks, setWindowWeeks] = useState(13);
   const [error, setError] = useState(null);
@@ -871,7 +892,7 @@ function CashflowPage({ access }) {
   useEffect(() => {
     (async () => {
       try {
-        const [allProjects, settingsRows, allDebtors] = await Promise.all([
+        const [allProjects, settingsRows, allDebtors, allOverheads, allCats] = await Promise.all([
           // Pull all non-archived non-draft projects — we'll filter to "qualifying" below
           sbSelect('projects',
             `select=*&status=in.(active,complete)&order=name.asc`,
@@ -882,6 +903,10 @@ function CashflowPage({ access }) {
           // Outstanding debtors only — cleared ones aren't future cash
           sbSelect('debtors',
             `select=*&status=eq.outstanding&order=contact_name.asc`,
+            access.session),
+          sbSelect('overheads', `select=*`, access.session),
+          sbSelect('overhead_categories',
+            `select=*&order=sort_order.asc,name.asc`,
             access.session),
         ]);
 
@@ -910,6 +935,8 @@ function CashflowPage({ access }) {
         }
 
         setDebtors(allDebtors || []);
+        setOverheads(allOverheads || []);
+        setOverheadCategories(allCats || []);
 
         if (settingsRows && settingsRows[0]) {
           setSettings(settingsRows[0]);
@@ -966,6 +993,10 @@ function CashflowPage({ access }) {
       perProject: {},
       // Synthetic row for unmatched debtors (rendered as a pseudo-project row at the bottom)
       unmatched: { weeks: {}, rowTotal: 0, past: 0, future: 0, hasAny: false },
+      // Per-overhead-category rows (rendered between projects and Week totals).
+      // overheadRows = [{ categoryId, categoryName, weeks, rowTotal, past, future, hasAny }, ...]
+      // — sorted in the same order as overheadCategories, with 'Uncategorised' last.
+      overheadRows: [],
       weekTotals: {},   // [mondayISO] = number
       grandTotal: 0,
       pastTotal: 0,     // events before window
@@ -1028,8 +1059,41 @@ function CashflowPage({ access }) {
       }
     }
 
+    // Overheads → one row per category (skip categories with no overheads).
+    // Each overhead's events are negative (outflows). Group by category_id.
+    const overheadsByCategory = {};
+    for (const o of (overheads || [])) {
+      const key = o.category_id || '__uncategorised__';
+      (overheadsByCategory[key] = overheadsByCategory[key] || []).push(o);
+    }
+    const categoriesInOrder = [
+      ...(overheadCategories || []),
+      { id: '__uncategorised__', name: 'Uncategorised' },
+    ];
+    for (const cat of categoriesInOrder) {
+      const list = overheadsByCategory[cat.id];
+      if (!list || list.length === 0) continue;
+      const row = {
+        categoryId: cat.id,
+        categoryName: cat.name,
+        weeks: {},
+        rowTotal: 0, past: 0, future: 0, hasAny: false,
+      };
+      for (const wk of weekColumns) row.weeks[wk] = { total: 0, events: [] };
+      for (const o of list) {
+        const evs = overheadCashEvents(o, windowStart, windowEnd);
+        for (const ev of evs) {
+          placeEvent(row, ev);
+          row.hasAny = true;
+        }
+      }
+      if (row.hasAny || row.rowTotal !== 0) {
+        result.overheadRows.push(row);
+      }
+    }
+
     return result;
-  }, [qualifyingProjects, invoicesByProject, releasesByProject, debtors, weekColumns]);
+  }, [qualifyingProjects, invoicesByProject, releasesByProject, debtors, overheads, overheadCategories, weekColumns]);
 
   // Running balance row: opening balance + cumulative weekly inflows
   const runningBalance = useMemo(() => {
@@ -1045,7 +1109,7 @@ function CashflowPage({ access }) {
   }, [grid, settings, weekColumns]);
 
   if (error) return <ErrorMsg msg={error} />;
-  if (projects === null || settings === null || debtors === null) return <LoadingMsg label="Loading cashflow…" />;
+  if (projects === null || settings === null || debtors === null || overheads === null || overheadCategories === null) return <LoadingMsg label="Loading cashflow…" />;
 
   // Opening balance save handler
   const saveOpeningBalance = async (newBalance, newAsOfDate) => {
@@ -1094,6 +1158,14 @@ function CashflowPage({ access }) {
         'Other debtors', 'unmatched',
         ...cols.map(wk => (grid.unmatched.weeks[wk] && grid.unmatched.weeks[wk].total) || 0),
         grid.unmatched.rowTotal,
+      ]);
+    }
+    // Overhead category rows
+    for (const ohRow of grid.overheadRows) {
+      rows.push([
+        ohRow.categoryName, 'overhead',
+        ...cols.map(wk => (ohRow.weeks[wk] && ohRow.weeks[wk].total) || 0),
+        ohRow.rowTotal,
       ]);
     }
     // Totals
@@ -1292,10 +1364,11 @@ function CashflowPage({ access }) {
   // dominant signal.
   const tintForEvents = (events) => {
     if (!events || events.length === 0) return 'transparent';
-    const totals = { invoice: 0, retention: 0, debtor: 0 };
+    const totals = { invoice: 0, retention: 0, debtor: 0, overhead: 0 };
     for (const ev of events) {
       const key = ev.source === 'retention' ? 'retention'
                 : ev.source === 'debtor'    ? 'debtor'
+                : ev.source === 'overhead'  ? 'overhead'
                 : 'invoice';
       totals[key] += Math.abs(Number(ev.gross) || 0);
     }
@@ -1306,6 +1379,7 @@ function CashflowPage({ access }) {
     }
     if (dominant === 'retention') return C.amberLight;
     if (dominant === 'debtor')    return C.prussianLight;
+    if (dominant === 'overhead')  return C.redLight;
     return C.greenLight;
   };
 
@@ -1410,6 +1484,7 @@ function CashflowPage({ access }) {
             <LegendSwatch colour={C.greenLight} label="Invoice payment" />
             <LegendSwatch colour={C.amberLight} label="Retention release" />
             <LegendSwatch colour={C.prussianLight} label="Debtor (predicted)" />
+            <LegendSwatch colour={C.redLight} label="Overhead (outflow)" />
             <span style={{ color: C.muted, fontStyle: 'italic' }}>
               Mixed cells take the colour of the largest contributor · negative figures shown in red
             </span>
@@ -1655,6 +1730,81 @@ function CashflowPage({ access }) {
                 </div>
                 );
               })()}
+
+              {/* Overhead category rows — one per category, between projects/debtors and totals */}
+              {grid.overheadRows.map(ohRow => {
+                const ohValues = [
+                  ...weekColumns.map(wk => fmtCellAmount((ohRow.weeks[wk] && ohRow.weeks[wk].total) || 0)),
+                  fmtCellAmount(ohRow.rowTotal),
+                ];
+                const ohMinHeight = rowMinHeightFor(ohValues);
+                const ohJustify = 'flex-end';
+                return (
+                  <div key={`oh:${ohRow.categoryId}`} style={{
+                    display: 'grid',
+                    gridTemplateColumns: gridCols,
+                    borderBottom: `1px solid ${C.line}`,
+                    fontVariantNumeric: 'tabular-nums',
+                    minHeight: ohMinHeight || undefined,
+                  }}>
+                    <div style={{
+                      padding: '8px', overflow: 'hidden', minWidth: 0,
+                      borderRight: `3px solid ${C.red}`,
+                      display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                    }}>
+                      <a href={buildHash(['overheads'])} style={{
+                        color: C.text, fontWeight: 600, textDecoration: 'none',
+                        fontSize: 13,
+                      }}>
+                        {ohRow.categoryName}
+                      </a>
+                      <span style={{ fontSize: 10, color: C.muted, fontStyle: 'italic' }}>
+                        overhead
+                      </span>
+                    </div>
+                    {weekColumns.map(wk => {
+                      const cell = ohRow.weeks[wk] || { total: 0, events: [] };
+                      const hasEvents = cell.events.length > 0;
+                      return (
+                        <button
+                          key={wk}
+                          onClick={hasEvents ? () => openDrill(wk, ohRow.categoryName, cell.events) : undefined}
+                          disabled={!hasEvents}
+                          style={{
+                            border: 'none',
+                            background: hasEvents ? C.redLight : 'transparent',
+                            cursor: hasEvents ? 'pointer' : 'default',
+                            padding: zoomConfig.rotated ? '6px 0' : '8px 4px',
+                            fontFamily: 'inherit',
+                            fontSize: zoomConfig.fontSize,
+                            color: hasEvents ? textColorForValue(cell.total) : C.line,
+                            fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
+                            borderRight: `1px solid ${C.line}`,
+                            overflow: 'hidden', minWidth: 0,
+                            display: 'flex', alignItems: 'center', justifyContent: ohJustify,
+                          }}
+                          title={hasEvents
+                            ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view`
+                            : ''}
+                        >
+                          <CellText autoRotate>{fmtCellAmount(cell.total)}</CellText>
+                        </button>
+                      );
+                    })}
+                    <div style={{
+                      padding: zoomConfig.rotated ? '6px 0' : '8px 6px',
+                      fontWeight: 700, color: textColorForValue(ohRow.rowTotal),
+                      background: C.bg, fontSize: zoomConfig.fontSize,
+                      overflow: 'hidden', minWidth: 0,
+                      display: 'flex', alignItems: 'center', justifyContent: ohJustify,
+                    }}
+                      title={`£${fmtMoney(ohRow.rowTotal)}`}
+                    >
+                      <CellText autoRotate>{fmtCellAmount(ohRow.rowTotal)}</CellText>
+                    </div>
+                  </div>
+                );
+              })}
 
               {/* Week totals row */}
               {(() => {
@@ -1921,11 +2071,13 @@ function CashflowDrillModal({ drill, onClose }) {
                     marginLeft: 4,
                     color: ev.source === 'retention' ? C.amber
                       : ev.source === 'debtor' ? C.prussian
+                      : ev.source === 'overhead' ? C.redStatus
                       : C.green,
                     fontWeight: 600,
                   }}>
                     {ev.source === 'retention' ? 'Retention release'
                       : ev.source === 'debtor' ? (ev.bucket === 'override' ? 'Debtor override' : `Debtor — ${BUCKET_LABELS[ev.bucket] || ev.bucket}`)
+                      : ev.source === 'overhead' ? 'Overhead'
                       : 'Invoice payment'}
                   </span>
                 </div>
@@ -1944,8 +2096,19 @@ function CashflowDrillModal({ drill, onClose }) {
                     )}
                   </div>
                 )}
+                {ev.source === 'overhead' && (
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                    £{fmtMoney(ev.amountNet)} net
+                    {ev.vat > 0 && <span> · +£{fmtMoney(ev.vat)} VAT</span>}
+                    {' · outflow'}
+                  </div>
+                )}
               </div>
-              <div style={{ fontSize: 16, fontWeight: 700, color: C.green, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+              <div style={{
+                fontSize: 16, fontWeight: 700,
+                color: ev.gross < 0 ? C.redStatus : C.green,
+                fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+              }}>
                 £{fmtMoney(ev.gross)}
               </div>
             </div>
@@ -4599,7 +4762,758 @@ function parseFlexibleDate(s) {
   return null;
 }
 
-function OverheadListStub()             { return <StubPage title="Overheads" subtitle="Recurring and one-off business costs.">Overhead list — Stage 7.</StubPage>; }
+// ============================================================
+// OVERHEADS — recurring/one-off business cost engine + UI
+// ============================================================
+
+// Expand a single overhead row into an array of cash events between two ISO
+// dates (inclusive of windowStart, exclusive of windowEnd). Each event has a
+// negative gross amount (outflow). VAT is added per-event when vat_applies.
+//
+// Generation cap: at most ~520 events per overhead (~10 years of weekly), so a
+// runaway loop can never lock the page.
+function overheadCashEvents(o, windowStart, windowEnd) {
+  const events = [];
+  if (!o || !o.start_date) return events;
+  const amountNet = Number(o.amount_net) || 0;
+  if (amountNet === 0) return events;
+  const vatRate = o.vat_applies ? (Number(o.vat_rate) || 0) : 0;
+  const grossPerOccurrence = -(amountNet * (1 + vatRate)); // negative = outflow
+  const interval = Math.max(1, Number(o.interval_count) || 1);
+  const endCap = o.end_date || addMonths(windowEnd || '2999-01-01', 0);
+
+  // Helper: should we emit at this date?
+  const dateInRange = (d) => {
+    if (windowStart && cmpDate(d, windowStart) < 0) return false;
+    if (windowEnd && cmpDate(d, windowEnd) > 0) return false;
+    if (endCap && cmpDate(d, endCap) > 0) return false;
+    return true;
+  };
+
+  let date = o.start_date;
+  let safety = 0;
+  const maxIterations = 600;
+
+  // Step forwards from start_date, emitting events that fall in the window.
+  // For frequencies other than 'once', we keep stepping until we exceed the
+  // window's end (or end_date, or the safety cap).
+  const step = (d) => {
+    if (o.frequency === 'weekly')    return addDays(d, 7 * interval);
+    if (o.frequency === 'monthly')   return addMonths(d, 1 * interval);
+    if (o.frequency === 'quarterly') return addMonths(d, 3 * interval);
+    if (o.frequency === 'custom')    return addDays(d, 7 * interval); // default to weekly cadence
+    return null; // 'once' — caller handles
+  };
+
+  if (o.frequency === 'once') {
+    if (dateInRange(date)) {
+      events.push({
+        date,
+        gross: grossPerOccurrence,
+        label: o.name,
+        source: 'overhead',
+        overhead: o,
+        amountNet,
+        vat: amountNet * vatRate,
+      });
+    }
+    return events;
+  }
+
+  while (safety++ < maxIterations) {
+    if (windowEnd && cmpDate(date, windowEnd) > 0) break;
+    if (endCap && cmpDate(date, endCap) > 0) break;
+    if (dateInRange(date)) {
+      events.push({
+        date,
+        gross: grossPerOccurrence,
+        label: o.name,
+        source: 'overhead',
+        overhead: o,
+        amountNet,
+        vat: amountNet * vatRate,
+      });
+    }
+    const next = step(date);
+    if (!next || next === date) break;
+    date = next;
+  }
+  return events;
+}
+
+const FREQUENCY_LABELS = {
+  once:      'One-off',
+  weekly:    'Weekly',
+  monthly:   'Monthly',
+  quarterly: 'Quarterly',
+  custom:    'Every N weeks',
+};
+
+function fmtRecurrence(o) {
+  if (o.frequency === 'once') return `One-off · ${fmtDateShort(o.start_date)}`;
+  const interval = Number(o.interval_count) || 1;
+  if (o.frequency === 'weekly') {
+    return interval === 1 ? `Weekly from ${fmtDateShort(o.start_date)}` : `Every ${interval} weeks from ${fmtDateShort(o.start_date)}`;
+  }
+  if (o.frequency === 'monthly') {
+    return interval === 1 ? `Monthly from ${fmtDateShort(o.start_date)}` : `Every ${interval} months from ${fmtDateShort(o.start_date)}`;
+  }
+  if (o.frequency === 'quarterly') {
+    return interval === 1 ? `Quarterly from ${fmtDateShort(o.start_date)}` : `Every ${interval} quarters from ${fmtDateShort(o.start_date)}`;
+  }
+  return `Every ${interval} weeks from ${fmtDateShort(o.start_date)}`;
+}
+
+// Approximate monthly run-rate of an overhead. Useful for the page header
+// summary. For 'once' overheads we return 0 (they're not a run-rate cost).
+function monthlyRunRate(o) {
+  const net = Number(o.amount_net) || 0;
+  const interval = Math.max(1, Number(o.interval_count) || 1);
+  if (o.frequency === 'once') return 0;
+  if (o.frequency === 'weekly' || o.frequency === 'custom') return (net * (52 / 12)) / interval;
+  if (o.frequency === 'monthly') return net / interval;
+  if (o.frequency === 'quarterly') return net / (3 * interval);
+  return 0;
+}
+
+function OverheadsPage({ access }) {
+  const [overheads, setOverheads] = useState(null);
+  const [categories, setCategories] = useState(null);
+  const [error, setError] = useState(null);
+  const [editing, setEditing] = useState(null); // overhead object, or 'new'
+
+  const reload = useCallback(async () => {
+    try {
+      const [ohs, cats] = await Promise.all([
+        sbSelect('overheads', 'select=*&order=name.asc', access.session),
+        sbSelect('overhead_categories', 'select=*&active=eq.true&order=sort_order.asc,name.asc', access.session),
+      ]);
+      setOverheads(ohs || []);
+      setCategories(cats || []);
+    } catch (e) { setError(e.message); }
+  }, [access.session]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (overheads === null || categories === null) return <LoadingMsg label="Loading overheads…" />;
+
+  // Group overheads by category id; 'Uncategorised' bucket holds nulls
+  const byCategory = {};
+  for (const o of overheads) {
+    const key = o.category_id || '__uncategorised__';
+    (byCategory[key] = byCategory[key] || []).push(o);
+  }
+
+  const totalRunRate = overheads.reduce((s, o) => s + monthlyRunRate(o), 0);
+
+  return (
+    <div style={{ maxWidth: 1400 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, marginBottom: 20 }}>
+        <div>
+          <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Overheads</h1>
+          <div style={{ fontSize: 13, color: C.muted }}>
+            {overheads.length} overhead{overheads.length === 1 ? '' : 's'} ·
+            £{fmtMoney(totalRunRate)}/month run-rate (recurring only)
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <a href={buildHash(['settings','categories'])} style={btnGhost()}>
+            Manage categories
+          </a>
+          <button onClick={() => setEditing('new')} style={btn(false)}>
+            + Add overhead
+          </button>
+        </div>
+      </div>
+
+      {overheads.length === 0 ? (
+        <SectionBox title="No overheads yet">
+          <div style={{ padding: 30, textAlign: 'center', color: C.muted, fontSize: 13 }}>
+            Add your first overhead to start factoring outflows into the cashflow grid.
+            <div style={{ marginTop: 12 }}>
+              <button onClick={() => setEditing('new')} style={btn(false)}>+ Add overhead</button>
+            </div>
+          </div>
+        </SectionBox>
+      ) : (
+        <div>
+          {/* Categories in their configured sort order */}
+          {categories.map(cat => {
+            const list = byCategory[cat.id] || [];
+            if (list.length === 0) return null;
+            return (
+              <OverheadCategorySection
+                key={cat.id}
+                title={cat.name}
+                overheads={list}
+                onEdit={setEditing}
+              />
+            );
+          })}
+          {/* Uncategorised */}
+          {byCategory.__uncategorised__ && byCategory.__uncategorised__.length > 0 && (
+            <OverheadCategorySection
+              title="Uncategorised"
+              overheads={byCategory.__uncategorised__}
+              onEdit={setEditing}
+              uncategorised
+            />
+          )}
+        </div>
+      )}
+
+      {editing && (
+        <OverheadEditModal
+          overhead={editing === 'new' ? null : editing}
+          categories={categories}
+          access={access}
+          onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); reload(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function OverheadCategorySection({ title, overheads, onEdit, uncategorised }) {
+  const subtotal = overheads.reduce((s, o) => s + monthlyRunRate(o), 0);
+  return (
+    <SectionBox
+      title={title}
+      actions={
+        <span style={{ fontSize: 12, color: C.muted, fontVariantNumeric: 'tabular-nums' }}>
+          {subtotal > 0 ? `£${fmtMoney(subtotal)}/mo` : ''}
+        </span>
+      }
+    >
+      <div>
+        {/* Header row */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: '2fr 130px 1.5fr 1fr 60px',
+          gap: 12,
+          padding: '6px 10px',
+          fontSize: 11, color: C.muted, fontWeight: 700,
+          textTransform: 'uppercase', letterSpacing: '0.04em',
+          borderBottom: `1px solid ${C.line}`,
+        }}>
+          <div>Name</div>
+          <div style={{ textAlign: 'right' }}>Amount</div>
+          <div>Recurrence</div>
+          <div>Next out</div>
+          <div></div>
+        </div>
+        {overheads.map(o => {
+          // Compute next occurrence from today
+          const today = new Date().toISOString().slice(0, 10);
+          const upcoming = overheadCashEvents(o, today, addMonths(today, 12));
+          const next = upcoming[0];
+          const gross = (Number(o.amount_net) || 0) * (1 + (o.vat_applies ? (Number(o.vat_rate) || 0) : 0));
+          return (
+            <div
+              key={o.id}
+              onClick={() => onEdit(o)}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '2fr 130px 1.5fr 1fr 60px',
+                gap: 12,
+                padding: '10px',
+                borderBottom: `1px solid ${C.line}`,
+                fontSize: 13, alignItems: 'center',
+                cursor: 'pointer', transition: 'background 0.1s',
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = C.bg}
+              onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+            >
+              <div>
+                <div style={{ fontWeight: 600, color: C.text }}>{o.name}</div>
+                {o.notes && (
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2, fontStyle: 'italic' }}>
+                    {o.notes.length > 60 ? o.notes.slice(0, 60) + '…' : o.notes}
+                  </div>
+                )}
+              </div>
+              <div style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                <div style={{ fontWeight: 600 }}>£{fmtMoney(gross)}</div>
+                <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>
+                  {o.vat_applies ? `£${fmtMoney(Number(o.amount_net) || 0)} + VAT` : 'no VAT'}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: C.muted }}>{fmtRecurrence(o)}</div>
+              <div style={{ fontSize: 12, color: next ? C.text : C.muted, fontStyle: next ? 'normal' : 'italic' }}>
+                {next ? fmtDateShort(next.date) : 'none upcoming'}
+              </div>
+              <div style={{ textAlign: 'center', color: C.muted, fontSize: 14 }}>›</div>
+            </div>
+          );
+        })}
+      </div>
+    </SectionBox>
+  );
+}
+
+// ============================================================
+// OVERHEAD EDIT / CREATE MODAL
+// ============================================================
+function OverheadEditModal({ overhead, categories, access, onClose, onSaved }) {
+  const isNew = !overhead;
+  const [form, setForm] = useState(() => ({
+    name: overhead ? overhead.name : '',
+    category_id: overhead ? (overhead.category_id || '') : '',
+    amount_net: overhead ? String(overhead.amount_net) : '',
+    vat_applies: overhead ? !!overhead.vat_applies : false,
+    vat_rate: overhead ? String(overhead.vat_rate) : '0.2000',
+    frequency: overhead ? overhead.frequency : 'monthly',
+    start_date: overhead ? overhead.start_date : new Date().toISOString().slice(0, 10),
+    end_date: overhead ? (overhead.end_date || '') : '',
+    interval_count: overhead ? String(overhead.interval_count || 1) : '1',
+    notes: overhead ? (overhead.notes || '') : '',
+  }));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    setError('');
+    if (!form.name.trim()) { setError('Name is required.'); return; }
+    const amt = Number(form.amount_net);
+    if (!isFinite(amt)) { setError('Amount must be a number.'); return; }
+    if (!form.start_date) { setError('Start date is required.'); return; }
+
+    setBusy(true);
+    const payload = {
+      name: form.name.trim(),
+      category_id: form.category_id || null,
+      amount_net: amt,
+      vat_applies: !!form.vat_applies,
+      vat_rate: form.vat_applies ? (Number(form.vat_rate) || 0.20) : 0.20,
+      frequency: form.frequency,
+      start_date: form.start_date,
+      end_date: form.end_date || null,
+      interval_count: Math.max(1, Number(form.interval_count) || 1),
+      notes: form.notes.trim() || null,
+    };
+    try {
+      if (isNew) {
+        payload.created_by_email = getEmail(access.session);
+        await sbInsert('overheads', payload, access.session);
+      } else {
+        await sbUpdate('overheads', `id=eq.${overhead.id}`, payload, access.session);
+      }
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  const remove = async () => {
+    if (!window.confirm(`Delete "${overhead.name}"? This will remove it from the cashflow grid for all future weeks.`)) return;
+    setBusy(true);
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/overheads?id=eq.${overhead.id}`,
+        { method: 'DELETE', headers: sbHeaders(access.session) }
+      );
+      if (!r.ok) throw new Error(`Delete failed: ${r.status} ${await r.text()}`);
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  // Preview: show the next 4 occurrences (using current form values)
+  const previewOverhead = {
+    ...form,
+    amount_net: Number(form.amount_net) || 0,
+    interval_count: Math.max(1, Number(form.interval_count) || 1),
+    vat_rate: Number(form.vat_rate) || 0.20,
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  const preview = form.start_date
+    ? overheadCashEvents(previewOverhead, form.start_date, addMonths(today, 24)).slice(0, 4)
+    : [];
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 580 }}>
+        <h2 style={{ fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif', color: C.red, marginTop: 0, marginBottom: 20, fontWeight: 700, fontSize: 22 }}>
+          {isNew ? 'New overhead' : overhead.name}
+        </h2>
+
+        <Field label="Name *">
+          <input
+            value={form.name}
+            onChange={(e) => setForm({ ...form, name: e.target.value })}
+            style={inp()}
+            placeholder="e.g. Office rent, Adobe CC, Pension contributions"
+            autoFocus={isNew}
+          />
+        </Field>
+
+        <Field label="Category">
+          <select
+            value={form.category_id}
+            onChange={(e) => setForm({ ...form, category_id: e.target.value })}
+            style={inp()}
+          >
+            <option value="">— Uncategorised —</option>
+            {categories.map(c => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </select>
+        </Field>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <Field label="Net amount (£) *">
+            <input
+              type="number"
+              step="0.01"
+              value={form.amount_net}
+              onChange={(e) => setForm({ ...form, amount_net: e.target.value })}
+              style={inp()}
+              placeholder="0.00"
+            />
+          </Field>
+          <Field label="VAT">
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', fontSize: 13 }}>
+              <input
+                type="checkbox"
+                checked={form.vat_applies}
+                onChange={(e) => setForm({ ...form, vat_applies: e.target.checked })}
+                style={{ width: 16, height: 16 }}
+              />
+              <span>VAT applies ({form.vat_applies ? `${(Number(form.vat_rate) * 100).toFixed(0)}%` : 'off'})</span>
+            </label>
+          </Field>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <Field label="Frequency *">
+            <select
+              value={form.frequency}
+              onChange={(e) => setForm({ ...form, frequency: e.target.value })}
+              style={inp()}
+            >
+              {Object.entries(FREQUENCY_LABELS).map(([k, label]) => (
+                <option key={k} value={k}>{label}</option>
+              ))}
+            </select>
+          </Field>
+          {(form.frequency !== 'once') && (
+            <Field label="Every">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="number"
+                  min="1"
+                  value={form.interval_count}
+                  onChange={(e) => setForm({ ...form, interval_count: e.target.value })}
+                  style={{ ...inp(), width: 60, flex: 'none' }}
+                />
+                <span style={{ fontSize: 12, color: C.muted }}>
+                  {form.frequency === 'weekly' ? 'week(s)'
+                    : form.frequency === 'monthly' ? 'month(s)'
+                    : form.frequency === 'quarterly' ? 'quarter(s)'
+                    : 'week(s)'}
+                </span>
+              </div>
+            </Field>
+          )}
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <Field label={form.frequency === 'once' ? 'Date *' : 'Start date *'}>
+            <input
+              type="date"
+              value={form.start_date}
+              onChange={(e) => setForm({ ...form, start_date: e.target.value })}
+              style={inp()}
+            />
+          </Field>
+          {(form.frequency !== 'once') && (
+            <Field label="End date (optional)">
+              <input
+                type="date"
+                value={form.end_date}
+                onChange={(e) => setForm({ ...form, end_date: e.target.value })}
+                style={inp()}
+              />
+            </Field>
+          )}
+        </div>
+
+        <Field label="Notes">
+          <textarea
+            value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+            style={{ ...inp(), minHeight: 60, fontFamily: 'inherit', resize: 'vertical' }}
+            placeholder="Optional context — contract reference, payment terms, etc."
+          />
+        </Field>
+
+        {/* Preview */}
+        {preview.length > 0 && (
+          <div style={{ background: C.bg, padding: 12, borderRadius: 6, marginBottom: 14 }}>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+              Next {preview.length} occurrence{preview.length === 1 ? '' : 's'}
+            </div>
+            {preview.map((ev, i) => (
+              <div key={i} style={{
+                display: 'flex', justifyContent: 'space-between',
+                fontSize: 12, padding: '4px 0',
+                borderBottom: i === preview.length - 1 ? 'none' : `1px solid ${C.line}`,
+              }}>
+                <span>{fmtDateShort(ev.date)}</span>
+                <span style={{ color: C.redStatus, fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+                  £{fmtMoney(ev.gross)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {error && (
+          <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
+          {!isNew ? (
+            <button onClick={remove} disabled={busy} style={{ ...btnGhost(), color: C.redStatus, borderColor: C.redStatus }}>
+              Delete
+            </button>
+          ) : <div />}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} disabled={busy} style={btnGhost()}>Cancel</button>
+            <button onClick={save} disabled={busy} style={btn(busy)}>
+              {busy ? 'Saving…' : (isNew ? 'Create overhead' : 'Save changes')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SETTINGS → CATEGORIES — full CRUD for overhead_categories
+// ============================================================
+function SettingsCategoriesPage({ access }) {
+  const [categories, setCategories] = useState(null);
+  const [error, setError] = useState(null);
+  const [editing, setEditing] = useState(null); // category object | 'new'
+  const [counts, setCounts] = useState({}); // {category_id: number of overheads}
+
+  const reload = useCallback(async () => {
+    try {
+      const [cats, overheads] = await Promise.all([
+        sbSelect('overhead_categories', 'select=*&order=sort_order.asc,name.asc', access.session),
+        sbSelect('overheads', 'select=category_id', access.session),
+      ]);
+      setCategories(cats || []);
+      const c = {};
+      for (const o of overheads) {
+        if (o.category_id) c[o.category_id] = (c[o.category_id] || 0) + 1;
+      }
+      setCounts(c);
+    } catch (e) { setError(e.message); }
+  }, [access.session]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (error) return <ErrorMsg msg={error} />;
+  if (categories === null) return <LoadingMsg label="Loading categories…" />;
+
+  return (
+    <div style={{ maxWidth: 800 }}>
+      <a href={buildHash(['settings'])} style={{ color: C.muted, fontSize: 13, textDecoration: 'none' }}>
+        ← Back to settings
+      </a>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, marginTop: 12, marginBottom: 20 }}>
+        <div>
+          <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Overhead categories</h1>
+          <p style={{ color: C.muted, fontSize: 13, margin: 0 }}>
+            Categories group overheads on the cashflow grid — one row per category.
+            Sort order controls how they appear from top to bottom.
+          </p>
+        </div>
+        <button onClick={() => setEditing('new')} style={btn(false)}>+ Add category</button>
+      </div>
+
+      <SectionBox title={`${categories.length} categor${categories.length === 1 ? 'y' : 'ies'}`}>
+        <div style={{
+          display: 'grid', gridTemplateColumns: '60px 1fr 1fr 100px 32px', gap: 12,
+          padding: '6px 10px', fontSize: 11, color: C.muted, fontWeight: 700,
+          textTransform: 'uppercase', letterSpacing: '0.04em',
+          borderBottom: `1px solid ${C.line}`,
+        }}>
+          <div style={{ textAlign: 'right' }}>Sort</div>
+          <div>Name</div>
+          <div>Status</div>
+          <div style={{ textAlign: 'right' }}>Overheads</div>
+          <div></div>
+        </div>
+        {categories.map(c => (
+          <div
+            key={c.id}
+            onClick={() => setEditing(c)}
+            style={{
+              display: 'grid', gridTemplateColumns: '60px 1fr 1fr 100px 32px', gap: 12,
+              padding: '10px', borderBottom: `1px solid ${C.line}`,
+              fontSize: 13, alignItems: 'center', cursor: 'pointer',
+              transition: 'background 0.1s',
+              opacity: c.active ? 1 : 0.6,
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = C.bg}
+            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+          >
+            <div style={{ textAlign: 'right', fontFamily: 'monospace', fontSize: 12, color: C.muted }}>{c.sort_order}</div>
+            <div style={{ fontWeight: 600 }}>{c.name}</div>
+            <div style={{ fontSize: 12 }}>
+              {c.active ? (
+                <span style={{ background: C.greenLight, color: C.green, padding: '2px 8px', borderRadius: 8, fontWeight: 600, fontSize: 11 }}>Active</span>
+              ) : (
+                <span style={{ background: C.line, color: C.muted, padding: '2px 8px', borderRadius: 8, fontWeight: 600, fontSize: 11 }}>Inactive</span>
+              )}
+            </div>
+            <div style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.muted }}>
+              {counts[c.id] || 0}
+            </div>
+            <div style={{ textAlign: 'center', color: C.muted, fontSize: 14 }}>›</div>
+          </div>
+        ))}
+      </SectionBox>
+
+      {editing && (
+        <CategoryEditModal
+          category={editing === 'new' ? null : editing}
+          inUseCount={editing === 'new' ? 0 : (counts[editing.id] || 0)}
+          access={access}
+          onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); reload(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function CategoryEditModal({ category, inUseCount, access, onClose, onSaved }) {
+  const isNew = !category;
+  const [form, setForm] = useState(() => ({
+    name: category ? category.name : '',
+    sort_order: category ? String(category.sort_order) : '50',
+    active: category ? !!category.active : true,
+  }));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    setError('');
+    if (!form.name.trim()) { setError('Name is required.'); return; }
+    setBusy(true);
+    const payload = {
+      name: form.name.trim(),
+      sort_order: Number(form.sort_order) || 50,
+      active: !!form.active,
+    };
+    try {
+      if (isNew) {
+        await sbInsert('overhead_categories', payload, access.session);
+      } else {
+        await sbUpdate('overhead_categories', `id=eq.${category.id}`, payload, access.session);
+      }
+      onSaved();
+    } catch (e) {
+      // Unique constraint on name
+      if (/duplicate|unique/i.test(e.message)) {
+        setError('A category with that name already exists.');
+      } else {
+        setError(e.message);
+      }
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    if (inUseCount > 0) {
+      alert(`Cannot delete — ${inUseCount} overhead${inUseCount === 1 ? '' : 's'} use this category. Reassign them first, or mark this category Inactive.`);
+      return;
+    }
+    if (!window.confirm(`Delete category "${category.name}"?`)) return;
+    setBusy(true);
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/overhead_categories?id=eq.${category.id}`,
+        { method: 'DELETE', headers: sbHeaders(access.session) }
+      );
+      if (!r.ok) throw new Error(`Delete failed: ${r.status} ${await r.text()}`);
+      onSaved();
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+
+  return (
+    <div className="arke-modal-backdrop" onClick={onClose}>
+      <div className="arke-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <h2 style={{ fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif', color: C.red, marginTop: 0, marginBottom: 20, fontWeight: 700, fontSize: 22 }}>
+          {isNew ? 'New category' : category.name}
+        </h2>
+        <Field label="Name *">
+          <input
+            value={form.name}
+            onChange={(e) => setForm({ ...form, name: e.target.value })}
+            style={inp()}
+            placeholder="e.g. Payroll, Software, Rent"
+            autoFocus={isNew}
+          />
+        </Field>
+        <Field label="Sort order">
+          <input
+            type="number"
+            value={form.sort_order}
+            onChange={(e) => setForm({ ...form, sort_order: e.target.value })}
+            style={inp()}
+          />
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>
+            Lower numbers appear first on the cashflow grid.
+          </div>
+        </Field>
+        <Field label="Status">
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', fontSize: 13 }}>
+            <input
+              type="checkbox"
+              checked={form.active}
+              onChange={(e) => setForm({ ...form, active: e.target.checked })}
+              style={{ width: 16, height: 16 }}
+            />
+            <span>Active (available in the add-overhead dropdown)</span>
+          </label>
+        </Field>
+
+        {!isNew && inUseCount > 0 && (
+          <div style={{ background: C.amberLight, color: C.text, padding: 10, borderRadius: 6, fontSize: 12, marginBottom: 12, borderLeft: `3px solid ${C.amber}` }}>
+            {inUseCount} overhead{inUseCount === 1 ? '' : 's'} currently use{inUseCount === 1 ? 's' : ''} this category.
+          </div>
+        )}
+
+        {error && (
+          <div style={{ background: C.redStatusLight, color: C.redStatus, padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 12, borderLeft: `3px solid ${C.redStatus}` }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
+          {!isNew ? (
+            <button onClick={remove} disabled={busy} style={{ ...btnGhost(), color: C.redStatus, borderColor: C.redStatus }}>
+              Delete
+            </button>
+          ) : <div />}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} disabled={busy} style={btnGhost()}>Cancel</button>
+            <button onClick={save} disabled={busy} style={btn(busy)}>
+              {busy ? 'Saving…' : (isNew ? 'Create' : 'Save')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ============================================================
 // PROJECT REGISTER
@@ -6194,15 +7108,6 @@ function SettingsHub({ access }) {
           href={buildHash(['settings','categories'])}
           title="Overhead categories"
           description="Curate the category list used to group overheads on the cashflow grid."
-          disabled
-          badge="Stage 7"
-        />
-        <SettingsCard
-          href={buildHash(['settings','csv-presets'])}
-          title="CSV import presets"
-          description="Saved column mappings for repeated debtor uploads."
-          disabled
-          badge="Stage 6"
         />
       </div>
     </div>
@@ -6789,8 +7694,7 @@ function miniBtn() {
   };
 }
 
-function SettingsCategoriesStub()     { return <StubPage title="Settings — Categories" subtitle="Curate the overhead category list.">Category management — Stage 7.</StubPage>; }
-function SettingsCsvPresetsStub()     { return <StubPage title="Settings — CSV presets" subtitle="Saved column mappings for debtor uploads.">CSV preset management — Stage 6.</StubPage>; }
+
 
 function NotFound({ navigate }) {
   return (
