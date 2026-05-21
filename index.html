@@ -734,7 +734,7 @@ function TopBar({ access }) {
 // ============================================================
 function StubPage({ title, subtitle, children }) {
   return (
-    <div style={{ maxWidth: 920 }}>
+    <div style={{ maxWidth: 1400 }}>
       <h1 style={brandTitle()}>{title}</h1>
       {subtitle && <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 24 }}>{subtitle}</p>}
       <Card>
@@ -760,6 +760,7 @@ function CashflowPage({ access }) {
   const [error, setError] = useState(null);
   const [drillCell, setDrillCell] = useState(null); // { weekStart, events }
   const [editingOB, setEditingOB] = useState(false);
+  const [hideEmptyExportCols, setHideEmptyExportCols] = useState(true);
 
   // Load everything in parallel
   useEffect(() => {
@@ -923,15 +924,21 @@ function CashflowPage({ access }) {
 
   // Export handlers
   const exportRows = () => {
+    // Determine which week columns to include. When hideEmptyExportCols is on,
+    // drop any week where the weekTotal is zero — this keeps the export
+    // compact and analytical (avoids walls of empty cells).
+    const cols = hideEmptyExportCols
+      ? weekColumns.filter(wk => (grid.weekTotals[wk] || 0) !== 0)
+      : weekColumns;
     // Returns array-of-arrays for CSV/XLSX consumption
-    const headerRow = ['Project', 'Status', ...weekColumns.map(wk => `Wk of ${fmtDateShort(wk)}`), 'Total'];
+    const headerRow = ['Project', 'Status', ...cols.map(wk => `Wk of ${fmtDateShort(wk)}`), 'Total'];
     const rows = [headerRow];
     for (const p of qualifyingProjects) {
       const row = grid.perProject[p.id];
       const cells = [
         p.name + (p.number ? ` (${p.number})` : ''),
         p.status,
-        ...weekColumns.map(wk => row.weeks[wk].total || 0),
+        ...cols.map(wk => row.weeks[wk].total || 0),
         row.rowTotal,
       ];
       rows.push(cells);
@@ -939,20 +946,37 @@ function CashflowPage({ access }) {
     // Totals
     rows.push([
       'Week total', '',
-      ...weekColumns.map(wk => grid.weekTotals[wk] || 0),
+      ...cols.map(wk => grid.weekTotals[wk] || 0),
       grid.grandTotal,
     ]);
-    // Running balance
+    // Running balance — compute against the *filtered* columns. We need to
+    // recompute against the cols index (running balance must be cumulative
+    // from the opening balance even if some weeks are omitted).
+    const filteredRunningBalance = [];
+    {
+      const ob = Number(settings.opening_balance) || 0;
+      let bal = ob;
+      // Walk through the FULL weekColumns array to keep the running totals
+      // accurate, then pick out the values that correspond to kept columns.
+      const balByWeek = {};
+      for (const wk of weekColumns) {
+        bal += (grid.weekTotals[wk] || 0);
+        balByWeek[wk] = bal;
+      }
+      for (const wk of cols) filteredRunningBalance.push(balByWeek[wk]);
+    }
     rows.push([
       `Running balance (from £${fmtMoney(settings.opening_balance)} on ${fmtDateShort(settings.opening_as_of_date)})`, '',
-      ...runningBalance,
-      runningBalance[runningBalance.length - 1],
+      ...filteredRunningBalance,
+      filteredRunningBalance[filteredRunningBalance.length - 1] != null
+        ? filteredRunningBalance[filteredRunningBalance.length - 1]
+        : (Number(settings.opening_balance) || 0),
     ]);
-    return rows;
+    return { rows, colsCount: cols.length, totalCols: weekColumns.length };
   };
 
   const exportCsv = () => {
-    const rows = exportRows();
+    const { rows } = exportRows();
     const csv = rows.map(r =>
       r.map(cell => {
         if (cell == null) return '';
@@ -971,28 +995,93 @@ function CashflowPage({ access }) {
       alert('XLSX library not loaded. Try refreshing the page.');
       return;
     }
-    const rows = exportRows();
+    const { rows, colsCount } = exportRows();
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    // Apply column widths
     ws['!cols'] = [
       { wch: 32 }, // project
       { wch: 10 }, // status
-      ...weekColumns.map(() => ({ wch: 14 })),
+      ...Array.from({ length: colsCount }, () => ({ wch: 14 })),
       { wch: 14 }, // total
     ];
     XLSX.utils.book_append_sheet(wb, ws, 'Cashflow');
     XLSX.writeFile(wb, `arke-cashflow-${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
-  // Cell width — sized to fit comfortable money amounts. Project name column is wider.
-  const PROJECT_COL = 240;
-  const TOTAL_COL = 110;
-  const WEEK_COL = 100;
-  const totalWidth = PROJECT_COL + (weekColumns.length * WEEK_COL) + TOTAL_COL;
+  // Zoom-aware sizing. At 13w the grid is comfortable; at 26w cells get tighter;
+  // at 52w cells become quite small but still fit on one screen. The grid stretches
+  // to fill the page (no horizontal scroll for reasonable container widths).
+  const zoomConfig =
+    windowWeeks <= 13 ? { projectCol: 220, totalCol: 110, weekMin: 64, fmt: 'full' } :
+    windowWeeks <= 26 ? { projectCol: 180, totalCol: 100, weekMin: 42, fmt: 'compact' } :
+    /* 52w */         { projectCol: 160, totalCol: 90,  weekMin: 28, fmt: 'tight' };
+
+  const gridCols = `${zoomConfig.projectCol}px repeat(${weekColumns.length}, minmax(${zoomConfig.weekMin}px, 1fr)) ${zoomConfig.totalCol}px`;
+  // Minimum width before the horizontal scroll kicks in (when window narrower than this)
+  const gridMinWidth = zoomConfig.projectCol + (weekColumns.length * zoomConfig.weekMin) + zoomConfig.totalCol;
+
+  // Cell amount formatter — abbreviates at tighter zooms.
+  //   'full'    £28,500 / £28,500.50 (no decimals if round)
+  //   'compact' £28,500
+  //   'tight'   £28.5k (always abbreviated)
+  const fmtCellAmount = (n) => {
+    if (n == null || n === 0) return '—';
+    if (zoomConfig.fmt === 'tight') {
+      if (Math.abs(n) >= 1000) {
+        const k = n / 1000;
+        // 1 decimal if < 100k, no decimal otherwise
+        return `£${Math.abs(k) >= 100 ? Math.round(k) : k.toFixed(1)}k`;
+      }
+      return `£${Math.round(n)}`;
+    }
+    if (zoomConfig.fmt === 'compact') {
+      return `£${Math.round(n).toLocaleString('en-GB')}`;
+    }
+    // 'full' — keep decimals if non-round, drop if .00
+    const rounded = Math.round(n);
+    if (Math.abs(n - rounded) < 0.005) {
+      return `£${rounded.toLocaleString('en-GB')}`;
+    }
+    return `£${fmtMoney(n)}`;
+  };
+
+  // Column-header formatter. At tighter zooms drop the month, show day-of-month only
+  // (the month-strip above headers shows the month).
+  const fmtWeekHeader = (wk) => {
+    if (zoomConfig.fmt === 'tight') {
+      const d = new Date(wk + 'T00:00:00Z');
+      return String(d.getUTCDate());
+    }
+    if (zoomConfig.fmt === 'compact') {
+      const d = new Date(wk + 'T00:00:00Z');
+      return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+    }
+    return fmtDateShort(wk).replace(/, 20\d\d/, '');
+  };
+
+  // Month-strip data: groups of consecutive weeks that share a month.
+  // Used as a row of headers above the per-week headers at compact/tight zooms.
+  const monthGroups = useMemo(() => {
+    if (zoomConfig.fmt === 'full') return null;
+    const groups = [];
+    let current = null;
+    for (let i = 0; i < weekColumns.length; i++) {
+      const d = new Date(weekColumns[i] + 'T00:00:00Z');
+      const key = `${d.getUTCFullYear()}-${d.getUTCMonth()}`;
+      const label = d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+      if (!current || current.key !== key) {
+        if (current) groups.push(current);
+        current = { key, label, span: 1 };
+      } else {
+        current.span++;
+      }
+    }
+    if (current) groups.push(current);
+    return groups;
+  }, [weekColumns, zoomConfig.fmt]);
 
   return (
-    <div style={{ maxWidth: 1280 }}>
+    <div style={{ maxWidth: 1400 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, marginBottom: 20 }}>
         <div>
           <h1 style={{ ...brandTitle(), margin: '0 0 6px' }}>Cashflow</h1>
@@ -1000,10 +1089,23 @@ function CashflowPage({ access }) {
             Weekly view across {qualifyingProjects.length} project{qualifyingProjects.length === 1 ? '' : 's'}.
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <WindowPicker value={windowWeeks} onChange={setWindowWeeks} />
-          <button onClick={exportCsv} style={btnGhost()} title="Download as CSV">↓ CSV</button>
-          <button onClick={exportXlsx} style={btnGhost()} title="Download as Excel">↓ XLSX</button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <WindowPicker value={windowWeeks} onChange={setWindowWeeks} />
+            <button onClick={exportCsv} style={btnGhost()} title="Download as CSV">↓ CSV</button>
+            <button onClick={exportXlsx} style={btnGhost()} title="Download as Excel">↓ XLSX</button>
+          </div>
+          <label style={{
+            display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, cursor: 'pointer',
+          }}>
+            <input
+              type="checkbox"
+              checked={hideEmptyExportCols}
+              onChange={(e) => setHideEmptyExportCols(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            Hide empty weeks from exports
+          </label>
         </div>
       </div>
 
@@ -1037,18 +1139,51 @@ function CashflowPage({ access }) {
           )}
 
           <div style={{ overflowX: 'auto' }}>
-            <div style={{ minWidth: totalWidth }}>
+            <div style={{ minWidth: gridMinWidth }}>
+              {/* Month strip (compact/tight zooms only) */}
+              {monthGroups && (
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: gridCols,
+                  fontSize: 10, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
+                  padding: '4px 0', borderBottom: `1px solid ${C.line}`,
+                }}>
+                  <div></div>
+                  {/* Use individual cells with grid-column spanning */}
+                  {(() => {
+                    const cells = [];
+                    let col = 2; // grid columns are 1-based; col 1 is project name
+                    for (const grp of monthGroups) {
+                      cells.push(
+                        <div key={grp.key} style={{
+                          gridColumn: `${col} / span ${grp.span}`,
+                          textAlign: 'center', padding: '0 4px',
+                          borderLeft: `1px solid ${C.line}`,
+                        }}>{grp.label}</div>
+                      );
+                      col += grp.span;
+                    }
+                    return cells;
+                  })()}
+                  <div></div>
+                </div>
+              )}
+
               {/* Header row */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                gridTemplateColumns: gridCols,
                 fontSize: 11, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
-                padding: '8px 4px', borderBottom: `2px solid ${C.line}`,
+                padding: '8px 0', borderBottom: `2px solid ${C.line}`,
               }}>
                 <div style={{ padding: '0 8px' }}>Project</div>
                 {weekColumns.map(wk => (
-                  <div key={wk} style={{ textAlign: 'right', padding: '0 8px' }}>
-                    {fmtDateShort(wk).replace(/, 20\d\d/, '')}
+                  <div key={wk} style={{
+                    textAlign: zoomConfig.fmt === 'tight' ? 'center' : 'right',
+                    padding: '0 4px',
+                    fontSize: zoomConfig.fmt === 'tight' ? 10 : 11,
+                  }}>
+                    {fmtWeekHeader(wk)}
                   </div>
                 ))}
                 <div style={{ textAlign: 'right', padding: '0 8px' }}>Total</div>
@@ -1060,16 +1195,26 @@ function CashflowPage({ access }) {
                 return (
                   <div key={p.id} style={{
                     display: 'grid',
-                    gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                    gridTemplateColumns: gridCols,
                     borderBottom: `1px solid ${C.line}`,
                     fontSize: 12, fontVariantNumeric: 'tabular-nums',
                   }}>
-                    <div style={{ padding: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      <a href={buildHash(['projects', p.id])} style={{ color: C.text, fontWeight: 600, textDecoration: 'none' }}>
+                    <div style={{ padding: '8px', overflow: 'hidden', minWidth: 0 }}>
+                      <a href={buildHash(['projects', p.id])} style={{
+                        color: C.text, fontWeight: 600, textDecoration: 'none',
+                        // Two-line wrap with ellipsis on overflow — uses standard line clamp
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        lineHeight: 1.25,
+                        wordBreak: 'break-word',
+                      }}>
                         {p.name}
                       </a>
                       {p.status === 'complete' && (
-                        <span style={{ fontSize: 10, color: C.muted, marginLeft: 6, fontStyle: 'italic' }}>(retention only)</span>
+                        <span style={{ fontSize: 10, color: C.muted, fontStyle: 'italic' }}>(retention only)</span>
                       )}
                       {p.number && <div style={{ fontSize: 10, color: C.muted, fontFamily: 'monospace' }}>{p.number}</div>}
                     </div>
@@ -1084,23 +1229,29 @@ function CashflowPage({ access }) {
                           style={{
                             border: 'none', background: hasEvents ? C.greenLight : 'transparent',
                             cursor: hasEvents ? 'pointer' : 'default',
-                            textAlign: 'right', padding: '8px 8px',
-                            fontFamily: 'inherit', fontSize: 12,
+                            textAlign: 'right',
+                            padding: zoomConfig.fmt === 'tight' ? '8px 3px' : '8px 6px',
+                            fontFamily: 'inherit',
+                            fontSize: zoomConfig.fmt === 'tight' ? 10 : 12,
                             color: hasEvents ? C.text : C.line,
                             fontVariantNumeric: 'tabular-nums', fontWeight: hasEvents ? 600 : 400,
                             borderRight: `1px solid ${C.line}`,
+                            overflow: 'hidden', whiteSpace: 'nowrap',
+                            minWidth: 0,
                           }}
-                          title={hasEvents ? `${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view` : ''}
+                          title={hasEvents
+                            ? `£${fmtMoney(cell.total)} · ${cell.events.length} event${cell.events.length === 1 ? '' : 's'} — click to view`
+                            : ''}
                         >
-                          {hasEvents ? `£${fmtMoney(cell.total)}` : '—'}
+                          {fmtCellAmount(cell.total)}
                         </button>
                       );
                     })}
                     <div style={{
                       padding: '8px', textAlign: 'right', fontWeight: 700, color: C.text,
-                      background: C.bg,
+                      background: C.bg, fontSize: zoomConfig.fmt === 'tight' ? 11 : 12,
                     }}>
-                      £{fmtMoney(row.rowTotal)}
+                      {fmtCellAmount(row.rowTotal)}
                     </div>
                   </div>
                 );
@@ -1109,29 +1260,36 @@ function CashflowPage({ access }) {
               {/* Week totals row */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                gridTemplateColumns: gridCols,
                 background: C.redSoft, borderTop: `2px solid ${C.line}`,
                 fontSize: 12, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
               }}>
-                <div style={{ padding: '10px 8px', color: C.red }}>Week totals</div>
+                <div style={{ padding: '10px 8px', color: C.red, fontSize: zoomConfig.fmt === 'tight' ? 11 : 12 }}>Week totals</div>
                 {weekColumns.map(wk => (
-                  <div key={wk} style={{ padding: '10px 8px', textAlign: 'right', color: C.text, borderRight: `1px solid ${C.line}` }}>
-                    {grid.weekTotals[wk] ? `£${fmtMoney(grid.weekTotals[wk])}` : '—'}
+                  <div key={wk} style={{
+                    padding: zoomConfig.fmt === 'tight' ? '10px 3px' : '10px 6px',
+                    textAlign: 'right', color: C.text, borderRight: `1px solid ${C.line}`,
+                    overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                    fontSize: zoomConfig.fmt === 'tight' ? 10 : 12,
+                  }}
+                    title={grid.weekTotals[wk] ? `£${fmtMoney(grid.weekTotals[wk])}` : ''}
+                  >
+                    {fmtCellAmount(grid.weekTotals[wk] || 0)}
                   </div>
                 ))}
-                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.green }}>
-                  £{fmtMoney(grid.grandTotal)}
+                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.green, fontSize: zoomConfig.fmt === 'tight' ? 11 : 12 }}>
+                  {fmtCellAmount(grid.grandTotal)}
                 </div>
               </div>
 
               {/* Running balance row */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: `${PROJECT_COL}px repeat(${weekColumns.length}, ${WEEK_COL}px) ${TOTAL_COL}px`,
+                gridTemplateColumns: gridCols,
                 background: C.prussianLight,
                 fontSize: 12, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
               }}>
-                <div style={{ padding: '10px 8px', color: C.prussian }}>
+                <div style={{ padding: '10px 8px', color: C.prussian, fontSize: zoomConfig.fmt === 'tight' ? 11 : 12 }}>
                   Running balance
                   <div style={{ fontSize: 10, fontWeight: 500, color: C.muted }}>
                     from £{fmtMoney(settings.opening_balance)} on {fmtDateShort(settings.opening_as_of_date)}
@@ -1139,15 +1297,20 @@ function CashflowPage({ access }) {
                 </div>
                 {runningBalance.map((bal, i) => (
                   <div key={i} style={{
-                    padding: '10px 8px', textAlign: 'right',
+                    padding: zoomConfig.fmt === 'tight' ? '10px 3px' : '10px 6px',
+                    textAlign: 'right',
                     color: bal < 0 ? C.redStatus : C.prussian,
                     borderRight: `1px solid ${C.line}`,
-                  }}>
-                    £{fmtMoney(bal)}
+                    overflow: 'hidden', whiteSpace: 'nowrap', minWidth: 0,
+                    fontSize: zoomConfig.fmt === 'tight' ? 10 : 12,
+                  }}
+                    title={`£${fmtMoney(bal)}`}
+                  >
+                    {fmtCellAmount(bal)}
                   </div>
                 ))}
-                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.prussian }}>
-                  £{fmtMoney(runningBalance[runningBalance.length - 1])}
+                <div style={{ padding: '10px 8px', textAlign: 'right', color: C.prussian, fontSize: zoomConfig.fmt === 'tight' ? 11 : 12 }}>
+                  {fmtCellAmount(runningBalance[runningBalance.length - 1])}
                 </div>
               </div>
             </div>
@@ -1427,7 +1590,7 @@ function ProjectDetailPage({ id, access, navigate }) {
   }
 
   return (
-    <div style={{ maxWidth: 1080 }}>
+    <div style={{ maxWidth: 1400 }}>
       <BackLink href={buildHash(['projects'])}>Projects</BackLink>
 
       {flash && (
@@ -3100,7 +3263,7 @@ function ProjectsRegisterPage({ access, navigate }) {
   const archivedCount = rows.filter(r => r.status === 'archived').length;
 
   return (
-    <div style={{ maxWidth: 1100 }}>
+    <div style={{ maxWidth: 1400 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18, flexWrap: 'wrap', gap: 12 }}>
         <div>
           <h1 style={brandTitle()}>{isEditor ? 'Projects' : 'My projects'}</h1>
@@ -3278,7 +3441,7 @@ function NewProjectWizard({ access, navigate, route, projectId }) {
   };
 
   return (
-    <div style={{ maxWidth: 760 }}>
+    <div style={{ maxWidth: 900 }}>
       <BackLink href={buildHash(['projects'])}>Projects</BackLink>
       <h1 style={brandTitle()}>{project ? `Edit “${project.name || 'Untitled'}”` : 'New project'}</h1>
       <p style={{ color: C.muted, fontSize: 14, marginTop: 0, marginBottom: 20 }}>
@@ -4788,7 +4951,7 @@ function SettingsUsersPage({ access }) {
   if (error) return <ErrorMsg msg={error} />;
 
   return (
-    <div style={{ maxWidth: 920 }}>
+    <div style={{ maxWidth: 1080 }}>
       <BackLink href={buildHash(['settings'])}>Settings</BackLink>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18, flexWrap: 'wrap', gap: 12 }}>
         <div>
