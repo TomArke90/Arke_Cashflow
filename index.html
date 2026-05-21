@@ -901,6 +901,7 @@ function CashflowPage({ access }) {
   const [overheadCategories, setOverheadCategories] = useState(null);
   const [settings, setSettings] = useState(null);
   const [windowWeeks, setWindowWeeks] = useState(13);
+  const [viewMode, setViewMode] = useState('weekly'); // 'weekly' | 'monthly'
   const [error, setError] = useState(null);
   const [drillCell, setDrillCell] = useState(null); // { weekStart, events }
   const [editingOB, setEditingOB] = useState(false);
@@ -999,6 +1000,34 @@ function CashflowPage({ access }) {
     for (let i = 0; i < windowWeeks; i++) cols.push(addDays(startMon, i * 7));
     return cols;
   }, [settings, windowWeeks]);
+
+  // Monthly columns — derived from the same window. Maps the configured
+  // windowWeeks to a sensible month count: 13w → 3 months, 26w → 6 months,
+  // 52w → 12 months. First month is the month containing the opening_as_of_date.
+  // Each column is the first-of-month ISO date (YYYY-MM-01).
+  const monthCount =
+    windowWeeks <= 13 ? 3 :
+    windowWeeks <= 26 ? 6 :
+    /* 52w */         12;
+
+  const monthColumns = useMemo(() => {
+    const anchor = settings ? settings.opening_as_of_date : new Date().toISOString().slice(0, 10);
+    const d = new Date(anchor + 'T00:00:00Z');
+    d.setUTCDate(1);
+    const cols = [];
+    for (let i = 0; i < monthCount; i++) {
+      const cur = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + i, 1));
+      cols.push(cur.toISOString().slice(0, 10));
+    }
+    return cols;
+  }, [settings, monthCount]);
+
+  // Returns the first-of-month ISO date that an event falls in, or null if outside window.
+  const monthOf = (iso) => {
+    if (!iso) return null;
+    const d = new Date(iso + 'T00:00:00Z');
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString().slice(0, 10);
+  };
 
   // Compute the per-project per-week cell totals + drill-through event lists.
   // Includes debtor cash events:
@@ -1125,6 +1154,103 @@ function CashflowPage({ access }) {
     }
     return balances;
   }, [grid, settings, weekColumns]);
+
+  // Monthly P&L grid — aggregates all cash events into monthly buckets, split
+  // into three sections so the view matches a traditional monthly P&L:
+  //   - Money In: project invoice payments (exclude retention releases) + debtor events
+  //   - Retention: retention release events
+  //   - Overheads: one row per category (negative amounts, outflow)
+  //
+  // Movement = sum of all of the above for the month (positive = net inflow).
+  // Opening / Closing track cash position month by month.
+  const monthlyGrid = useMemo(() => {
+    if (!qualifyingProjects || debtors === null || overheads === null) return null;
+    const monthSet = new Set(monthColumns);
+    const moneyIn = {};
+    const retention = {};
+    const otherDebtors = {};
+    const overheadRows = {}; // [categoryId] = { name, totals: {month: number}, events: {month: []} }
+
+    // Helper to add an event into a month bucket
+    const place = (target, ev) => {
+      const m = monthOf(ev.date);
+      if (!m || !monthSet.has(m)) return false;
+      target[m] = (target[m] || 0) + (Number(ev.gross) || 0);
+      return true;
+    };
+
+    // Walk projects: invoice events → moneyIn, retention events → retention,
+    //                debtor events linked to project → moneyIn (debtor income)
+    for (const p of qualifyingProjects) {
+      const projectEvents = projectCashEvents(p, invoicesByProject[p.id] || [], releasesByProject[p.id] || []);
+      for (const ev of projectEvents) {
+        if (ev.source === 'retention') place(retention, ev);
+        else place(moneyIn, ev);
+      }
+    }
+    // Debtor events
+    for (const d of (debtors || [])) {
+      for (const ev of debtorCashEvents(d)) {
+        if (d.project_id) place(moneyIn, ev);
+        else place(otherDebtors, ev);
+      }
+    }
+
+    // Overheads grouped by category, in configured sort order
+    const overheadsByCategory = {};
+    for (const o of (overheads || [])) {
+      const key = o.category_id || '__uncategorised__';
+      (overheadsByCategory[key] = overheadsByCategory[key] || []).push(o);
+    }
+    const windowStart = monthColumns[0];
+    // Last day of last month in window — use first-of-next-month minus 1 day
+    const lastMonth = new Date(monthColumns[monthColumns.length - 1] + 'T00:00:00Z');
+    const windowEnd = new Date(Date.UTC(lastMonth.getUTCFullYear(), lastMonth.getUTCMonth() + 1, 0)).toISOString().slice(0, 10);
+    const categoriesInOrder = [
+      ...(overheadCategories || []),
+      { id: '__uncategorised__', name: 'Uncategorised' },
+    ];
+    for (const cat of categoriesInOrder) {
+      const list = overheadsByCategory[cat.id];
+      if (!list || list.length === 0) continue;
+      const totals = {};
+      let hasAny = false;
+      for (const o of list) {
+        for (const ev of overheadCashEvents(o, windowStart, windowEnd)) {
+          const m = monthOf(ev.date);
+          if (!m || !monthSet.has(m)) continue;
+          totals[m] = (totals[m] || 0) + (Number(ev.gross) || 0);
+          hasAny = true;
+        }
+      }
+      if (hasAny) overheadRows[cat.id] = { id: cat.id, name: cat.name, totals };
+    }
+
+    // Movement + Opening + Closing
+    const movement = {};
+    for (const m of monthColumns) {
+      let net = (moneyIn[m] || 0) + (retention[m] || 0) + (otherDebtors[m] || 0);
+      for (const row of Object.values(overheadRows)) {
+        net += (row.totals[m] || 0);
+      }
+      movement[m] = net;
+    }
+    const opening = {};
+    const closing = {};
+    let runningBal = Number(settings ? settings.opening_balance : 0) || 0;
+    for (const m of monthColumns) {
+      opening[m] = runningBal;
+      closing[m] = runningBal + (movement[m] || 0);
+      runningBal = closing[m];
+    }
+
+    return {
+      moneyIn, retention, otherDebtors,
+      overheadRows: Object.values(overheadRows),  // ordered by categoriesInOrder
+      movement, opening, closing,
+      hasOtherDebtors: Object.values(otherDebtors).some(v => v !== 0),
+    };
+  }, [qualifyingProjects, invoicesByProject, releasesByProject, debtors, overheads, overheadCategories, monthColumns, settings]);
 
   if (error) return <ErrorMsg msg={error} />;
   if (projects === null || settings === null || debtors === null || overheads === null || overheadCategories === null) return <LoadingMsg label="Loading cashflow…" />;
@@ -1479,12 +1605,13 @@ function CashflowPage({ access }) {
         </SectionBox>
       ) : (
         <SectionBox
-          title="Cashflow grid"
+          title={viewMode === 'monthly' ? 'Monthly P&L forecast' : 'Cashflow grid'}
           actions={
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
               <span style={{ fontSize: 11, color: C.muted }}>
-                Click any cell for breakdown
+                {viewMode === 'monthly' ? 'Aggregated by month' : 'Click any cell for breakdown'}
               </span>
+              <ViewModePicker value={viewMode} onChange={setViewMode} />
               <WindowPicker value={windowWeeks} onChange={setWindowWeeks} />
             </div>
           }
@@ -1508,6 +1635,7 @@ function CashflowPage({ access }) {
             </span>
           </div>
 
+          {viewMode === 'weekly' && (<React.Fragment>
           {grid.pastTotal > 0 && (
             <div style={{ fontSize: 12, color: C.muted, padding: '6px 10px', background: C.bg, borderRadius: 4, marginBottom: 10 }}>
               {Object.values(grid.perProject).reduce((s, r) => s + (r.past > 0 ? 1 : 0), 0)} project{Object.values(grid.perProject).filter(r => r.past > 0).length === 1 ? ' has' : 's have'} cash events before the window — totalling £{fmtMoney(grid.pastTotal)}
@@ -1939,6 +2067,14 @@ function CashflowPage({ access }) {
               {Object.values(grid.perProject).filter(r => r.future > 0).length} project{Object.values(grid.perProject).filter(r => r.future > 0).length === 1 ? ' has' : 's have'} cash events after the window — totalling £{fmtMoney(grid.futureTotal)}
             </div>
           )}
+          </React.Fragment>)}
+
+          {viewMode === 'monthly' && monthlyGrid && (
+            <MonthlyPnLTable
+              monthlyGrid={monthlyGrid}
+              monthColumns={monthColumns}
+            />
+          )}
         </SectionBox>
       )}
 
@@ -2042,6 +2178,201 @@ function WindowPicker({ value, onChange }) {
           {opt}w
         </button>
       ))}
+    </div>
+  );
+}
+
+function ViewModePicker({ value, onChange }) {
+  const opts = [
+    { id: 'weekly',  label: 'Weekly' },
+    { id: 'monthly', label: 'Monthly P&L' },
+  ];
+  return (
+    <div style={{ display: 'inline-flex', border: `1px solid ${C.line}`, borderRadius: 6, overflow: 'hidden' }}>
+      {opts.map((opt, i) => (
+        <button
+          key={opt.id}
+          onClick={() => onChange(opt.id)}
+          style={{
+            padding: '8px 14px', fontSize: 12, fontFamily: 'inherit', fontWeight: 600,
+            background: value === opt.id ? C.red : C.white,
+            color: value === opt.id ? C.white : C.text,
+            border: 'none',
+            borderLeft: i === 0 ? 'none' : `1px solid ${C.line}`,
+            cursor: 'pointer',
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================
+// MONTHLY P&L TABLE — alternative to the weekly cashflow grid.
+// Layout (rows top to bottom):
+//   Opening
+//   Money In        (project invoices + linked debtor events)
+//   Retention       (retention release events)
+//   Other debtors   (unmatched debtor events — only if non-zero)
+//   ...overhead category rows (negative outflows, red)
+//   Movement        (sum of above)
+//   Closing forecast (Opening + Movement)
+// ============================================================
+function MonthlyPnLTable({ monthlyGrid, monthColumns }) {
+  // First column is the label, then one column per month.
+  // Label column has a fixed width; month columns share remaining space equally.
+  const gridCols = `220px repeat(${monthColumns.length}, minmax(0, 1fr))`;
+
+  // Month header label like "Jan 2026"
+  const fmtMonthHeader = (iso) => {
+    const d = new Date(iso + 'T00:00:00Z');
+    return d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  };
+
+  // Cell renderer for £ amounts. Negative → red. Empty/zero → muted dash.
+  // Bold + tint optional (used for Opening / Movement / Closing rows).
+  const PnLCell = ({ value, bold, background, textColor, alignRight }) => {
+    const isZero = !value || Number(value) === 0;
+    const display = isZero ? '—' : `£${fmtMoney(value)}`;
+    return (
+      <div style={{
+        padding: '10px 12px',
+        textAlign: alignRight === false ? 'left' : 'right',
+        fontSize: 13,
+        fontWeight: bold ? 700 : 500,
+        color: isZero ? C.line : (textColor || (Number(value) < 0 ? C.redStatus : C.text)),
+        background: background || 'transparent',
+        fontVariantNumeric: 'tabular-nums',
+        borderRight: `1px solid ${C.line}`,
+        minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap',
+      }}
+        title={isZero ? '' : `£${fmtMoney(value)}`}
+      >{display}</div>
+    );
+  };
+
+  // Row renderer — left label cell + N month cells. `rowStyle` lets us tint a
+  // whole row (Opening / Movement / Closing) consistently.
+  const Row = ({ label, getter, bold, background, textColor, divider }) => (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: gridCols,
+      borderBottom: divider ? `2px solid ${C.line}` : `1px solid ${C.line}`,
+    }}>
+      <div style={{
+        padding: '10px 14px',
+        fontSize: 13,
+        fontWeight: bold ? 700 : 600,
+        color: textColor || C.text,
+        background: background || 'transparent',
+        borderRight: `3px solid ${C.red}`,
+        textTransform: bold ? 'uppercase' : 'none',
+        letterSpacing: bold ? '0.04em' : '0',
+      }}>
+        {label}
+      </div>
+      {monthColumns.map(m => (
+        <PnLCell key={m} value={getter(m)} bold={bold} background={background} textColor={textColor} />
+      ))}
+    </div>
+  );
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <div style={{ minWidth: 220 + monthColumns.length * 110 }}>
+        {/* Header row — month labels */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: gridCols,
+          fontSize: 11, color: C.muted, fontWeight: 700,
+          textTransform: 'uppercase', letterSpacing: '0.04em',
+          padding: '8px 0', borderBottom: `2px solid ${C.line}`,
+        }}>
+          <div style={{ padding: '0 14px', borderRight: `3px solid ${C.red}` }}>Forecast</div>
+          {monthColumns.map(m => (
+            <div key={m} style={{ padding: '0 12px', textAlign: 'right' }}>
+              {fmtMonthHeader(m)}
+            </div>
+          ))}
+        </div>
+
+        {/* Opening row — neutral tint, bold */}
+        <Row
+          label="Opening"
+          getter={(m) => monthlyGrid.opening[m]}
+          bold
+          background={C.neutralLight}
+          textColor={C.text}
+          divider
+        />
+
+        {/* Money In */}
+        <Row
+          label="Money In"
+          getter={(m) => monthlyGrid.moneyIn[m]}
+          background={C.greenLight}
+          textColor={C.green}
+        />
+
+        {/* Retention */}
+        <Row
+          label="Retention"
+          getter={(m) => monthlyGrid.retention[m]}
+          background={C.amberLight}
+          textColor={C.amber}
+        />
+
+        {/* Other debtors — only if any */}
+        {monthlyGrid.hasOtherDebtors && (
+          <Row
+            label="Other debtors"
+            getter={(m) => monthlyGrid.otherDebtors[m]}
+            background={C.prussianLight}
+            textColor={C.prussian}
+          />
+        )}
+
+        {/* Per-category overhead rows */}
+        {monthlyGrid.overheadRows.map(row => (
+          <div key={row.id} style={{
+            display: 'grid',
+            gridTemplateColumns: gridCols,
+            borderBottom: `1px solid ${C.line}`,
+          }}>
+            <div style={{
+              padding: '10px 14px',
+              fontSize: 13, fontWeight: 600, color: C.text,
+              borderRight: `3px solid ${C.red}`,
+            }}>
+              {row.name}
+            </div>
+            {monthColumns.map(m => (
+              <PnLCell key={m} value={row.totals[m]} />
+            ))}
+          </div>
+        ))}
+
+        {/* Movement — emphasised. Total of all above. */}
+        <Row
+          label="Movement"
+          getter={(m) => monthlyGrid.movement[m]}
+          bold
+          background={C.redSoft}
+          textColor={C.red}
+          divider
+        />
+
+        {/* Closing forecast — green, bold, anchors next month's Opening */}
+        <Row
+          label="Closing forecast"
+          getter={(m) => monthlyGrid.closing[m]}
+          bold
+          background={C.greenLight}
+          textColor={C.green}
+        />
+      </div>
     </div>
   );
 }
