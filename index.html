@@ -2556,8 +2556,9 @@ function PnLTable({ pnlGrid, pnlPeriods, moneyInOpen, setMoneyInOpen, moneyOutOp
       >
         {caret !== undefined && (
           <span style={{
-            display: 'inline-block', width: 12, fontSize: 11,
-            color: textColor || C.text, opacity: 0.7,
+            display: 'inline-block', width: 18, fontSize: 18,
+            lineHeight: 1, color: textColor || C.text, opacity: 0.9,
+            fontWeight: 700,
           }}>{caret ? '▾' : '▸'}</span>
         )}
         <span style={{ flex: 1 }}>{label}</span>
