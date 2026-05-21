@@ -456,7 +456,17 @@ function App() {
   const { route, navigate } = useHashRoute();
 
   if (access.loading) {
-    return <Shell session={access.session}><LoadingMsg label="Loading…" /></Shell>;
+    return (
+      <Shell session={access.session}>
+        <div style={{
+          flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: C.white, fontSize: 14, opacity: 0.85,
+          fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+        }}>
+          Loading…
+        </div>
+      </Shell>
+    );
   }
 
   // Not signed in at all
@@ -537,15 +547,47 @@ function RouteSwitch({ route, navigate, access }) {
 function PublicLanding() {
   const [showSignIn, setShowSignIn] = useState(false);
   return (
-    <div style={{ maxWidth: 540, margin: '80px auto', textAlign: 'center', padding: '0 24px' }}>
-      <h1 style={brandTitle()}>Arke Cashflow Hub</h1>
-      <p style={{ color: C.muted, fontSize: 15, lineHeight: 1.6, marginBottom: 32 }}>
-        Internal tool for tracking project cashflow, debtors, and overheads.
-        Access is by invitation — speak to an editor to be added.
-      </p>
-      <button onClick={() => setShowSignIn(true)} style={btn(false)}>
-        Sign in
+    <div style={{
+      flex: 1,
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      padding: '40px 24px', textAlign: 'center',
+    }}>
+      <div style={{
+        fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+        fontSize: 72, color: C.white, fontWeight: 400, letterSpacing: '-0.02em',
+        lineHeight: 1,
+      }}>
+        arke
+      </div>
+      <div style={{
+        fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+        fontSize: 18, color: C.white, opacity: 0.85,
+        letterSpacing: '0.08em', textTransform: 'lowercase',
+        marginTop: 6, marginBottom: 40,
+      }}>
+        cashflow hub
+      </div>
+      <button
+        onClick={() => setShowSignIn(true)}
+        style={{
+          padding: '12px 32px',
+          background: C.white, color: C.red,
+          border: 'none', borderRadius: 6,
+          fontSize: 14, fontWeight: 700,
+          cursor: 'pointer', fontFamily: 'inherit',
+          letterSpacing: '0.02em',
+        }}
+      >
+        Sign in (Arke staff)
       </button>
+      <div style={{
+        marginTop: 28, fontSize: 12, color: C.white, opacity: 0.75,
+        maxWidth: 380, lineHeight: 1.7,
+      }}>
+        Forecasting tool for Arke Creative · internal use only.<br/>
+        Sign in with your @arkecreative.co.uk account.
+      </div>
       {showSignIn && <SignInModal onClose={() => setShowSignIn(false)} onSignedIn={() => window.location.reload()} />}
     </div>
   );
@@ -571,12 +613,26 @@ function NoAccessScreen({ reason, email }) {
   };
   const m = messages[reason] || { title: 'Access denied', body: `Couldn't verify access for ${email}.` };
   return (
-    <div style={{ maxWidth: 480, margin: '80px auto', padding: '0 24px', textAlign: 'center' }}>
-      <Card>
-        <h2 style={{ ...brandTitle(), fontSize: 22, marginTop: 0 }}>{m.title}</h2>
-        <p style={{ color: C.muted, fontSize: 14, lineHeight: 1.6 }}>{m.body}</p>
-        <button onClick={signOut} style={{ ...btnGhost(), marginTop: 16 }}>Sign out</button>
-      </Card>
+    <div style={{
+      flex: 1,
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      padding: '40px 24px',
+    }}>
+      <div style={{
+        fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+        fontSize: 48, color: C.white, fontWeight: 400, letterSpacing: '-0.02em',
+        lineHeight: 1, marginBottom: 32,
+      }}>
+        arke
+      </div>
+      <div style={{ maxWidth: 480, width: '100%' }}>
+        <Card>
+          <h2 style={{ ...brandTitle(), fontSize: 22, marginTop: 0 }}>{m.title}</h2>
+          <p style={{ color: C.muted, fontSize: 14, lineHeight: 1.6 }}>{m.body}</p>
+          <button onClick={signOut} style={{ ...btnGhost(), marginTop: 16 }}>Sign out</button>
+        </Card>
+      </div>
     </div>
   );
 }
@@ -650,7 +706,6 @@ function SignedInShell({ access, route, navigate, children }) {
     <div style={{ minHeight: '100vh', background: C.bg, display: 'flex' }}>
       <Sidebar isEditor={isEditor} route={route} navigate={navigate} access={access} />
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        <TopBar access={access} />
         <main style={{ flex: 1, padding: '24px 32px 80px' }}>
           {children}
         </main>
@@ -674,45 +729,93 @@ function Sidebar({ isEditor, route, navigate, access }) {
   const seg = route.path[0] || (isEditor ? 'cashflow' : 'projects');
   return (
     <aside style={{
-      width: 220, background: C.white, borderRight: `1px solid ${C.line}`,
-      padding: '20px 12px', display: 'flex', flexDirection: 'column',
+      width: 220, background: C.red, color: C.white,
+      padding: '24px 0 16px',
+      display: 'flex', flexDirection: 'column',
       position: 'sticky', top: 0, height: '100vh',
+      flexShrink: 0,
     }}>
+      {/* Wordmark */}
       <a href="#/" style={{
-        fontSize: 26, color: C.red, fontWeight: 400, letterSpacing: '-0.01em',
-        textDecoration: 'none', padding: '0 8px 24px', display: 'block',
-      }}>arke</a>
-      <nav style={{ flex: 1 }}>
+        textDecoration: 'none',
+        padding: '0 20px 32px', display: 'block',
+        fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+      }}>
+        <div style={{
+          fontSize: 30, color: C.white, fontWeight: 400, letterSpacing: '-0.01em',
+          lineHeight: 1,
+        }}>arke</div>
+        <div style={{
+          fontSize: 10, color: C.white, opacity: 0.7, marginTop: 4,
+          letterSpacing: '0.12em', textTransform: 'uppercase',
+        }}>Cashflow Hub</div>
+      </a>
+
+      {/* Nav */}
+      <nav style={{ flex: 1, overflowY: 'auto' }}>
         {items.map(it => {
           const active = seg === it.id;
           return (
-            <a key={it.id} href={buildHash(it.path)} className={`arke-sidebar-item ${active ? 'active' : ''}`}
+            <a key={it.id} href={buildHash(it.path)}
               style={{
-                display: 'block', padding: '10px 12px', borderRadius: 6,
-                textDecoration: 'none', color: active ? C.red : C.text,
-                fontSize: 14, fontWeight: active ? 600 : 500, marginBottom: 2,
-              }}>
+                display: 'block',
+                padding: '11px 20px',
+                textDecoration: 'none',
+                color: C.white,
+                fontSize: 14,
+                fontWeight: active ? 700 : 500,
+                background: active ? C.redDark : 'transparent',
+                borderLeft: active ? `3px solid ${C.white}` : `3px solid transparent`,
+                opacity: active ? 1 : 0.92,
+                fontFamily: 'inherit',
+                transition: 'background 0.1s',
+              }}
+              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(0,0,0,0.12)'; }}
+              onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+            >
               {it.label}
             </a>
           );
         })}
       </nav>
-      <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, fontSize: 11, color: C.muted }}>
-        <div style={{ padding: '0 8px', marginBottom: 4 }}>Signed in as</div>
-        <div style={{ padding: '0 8px', color: C.text, fontWeight: 500, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+
+      {/* User block + sign-out at the bottom */}
+      <div style={{
+        borderTop: '1px solid rgba(255,255,255,0.2)',
+        padding: '14px 20px 0', marginTop: 8,
+      }}>
+        <div style={{ fontSize: 11, color: C.white, opacity: 0.7, marginBottom: 2 }}>Signed in as</div>
+        <div style={{
+          fontSize: 12, color: C.white, fontWeight: 600,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
           {access.displayName || getEmail(access.session)}
         </div>
-        <div style={{ padding: '0 8px', marginTop: 2, fontSize: 11 }}>
+        <div style={{ fontSize: 11, marginTop: 4, marginBottom: 14 }}>
           <span style={{
-            background: isEditor ? C.redLight : C.prussianLight,
-            color: isEditor ? C.red : C.prussian,
-            padding: '2px 6px', borderRadius: 8, fontWeight: 600,
+            background: 'rgba(255,255,255,0.15)',
+            color: C.white,
+            padding: '2px 8px', borderRadius: 8, fontWeight: 600,
+            letterSpacing: '0.03em',
           }}>{isEditor ? 'Editor' : 'Contributor'}</span>
         </div>
         <button onClick={signOut} style={{
-          marginTop: 12, background: 'transparent', border: 'none', cursor: 'pointer',
-          color: C.muted, fontSize: 12, padding: '4px 8px', fontFamily: 'inherit',
-        }}>Sign out</button>
+          width: '100%',
+          padding: '8px 12px',
+          background: 'transparent',
+          color: C.white,
+          border: `1px solid rgba(255,255,255,0.8)`,
+          borderRadius: 6,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+          fontSize: 12, fontWeight: 600,
+          letterSpacing: '0.02em',
+        }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.15)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+        >
+          Sign out
+        </button>
       </div>
     </aside>
   );
@@ -6704,18 +6807,25 @@ function NotFound({ navigate }) {
 // LAYOUT PRIMITIVES — ported from furniture form
 // ============================================================
 function Shell({ children, session }) {
+  // Full-carmine layout for unauthed pages (login + no-access screens).
+  // No top banner — the wordmark is rendered by the inner content.
   return (
-    <div style={{ minHeight: '100vh', background: C.bg, fontFamily: 'inherit', color: C.text }}>
-      <header style={{
-        background: C.white, borderBottom: `1px solid ${C.line}`,
-        padding: '14px 32px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-      }}>
-        <a href="#/" style={{ fontSize: 26, color: C.red, fontWeight: 400, letterSpacing: '-0.01em', textDecoration: 'none' }}>arke</a>
-        {session && getEmail(session) && (
-          <span style={{ fontSize: 13, color: C.muted }}>{getEmail(session)}</span>
-        )}
-      </header>
+    <div style={{
+      minHeight: '100vh',
+      background: C.red,
+      color: C.white,
+      fontFamily: 'inherit',
+      display: 'flex', flexDirection: 'column',
+      position: 'relative',
+    }}>
       {children}
+      <div style={{
+        position: 'absolute', bottom: 16, right: 24,
+        fontSize: 11, color: C.white, opacity: 0.5,
+        fontFamily: '"Century Gothic", "Avenir Next", Avenir, system-ui, sans-serif',
+      }}>
+        © Arke Creative
+      </div>
     </div>
   );
 }
